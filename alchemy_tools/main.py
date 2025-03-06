@@ -18,6 +18,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+DB_PATH = "alchemy.db"
 
 ############################
 # НАСТРОЙКА ЛОГИРОВАНИЯ    #
@@ -28,111 +29,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-############################
-# БЛОК 1. РАБОТА С БАЗОЙ   #
-############################
-
-DB_PATH = "alchemy.db"
-
-def setup_database():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS ingredients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            code TEXT,
-            name TEXT,
-            UNIQUE(user_id, code)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS properties (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            ingredient_id INTEGER,
-            description TEXT,
-            type TEXT,
-            is_positive BOOLEAN,
-            is_main BOOLEAN DEFAULT FALSE,
-            FOREIGN KEY (ingredient_id) REFERENCES ingredients(id)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS recipes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            name TEXT,
-            ingredient_ids TEXT,
-            effects TEXT
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def populate_test_data_for_user(user_id):
-    """Инициализация стартовых данных для нового пользователя"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM ingredients WHERE user_id = ?", (user_id,))
-    count = cursor.fetchone()[0]
-    if count > 0:
-        conn.close()
-        return  # Данные уже есть
-
-    test_data = [
-        ("KR1", "Когти Радужного Дракона", [
-            ("Пробуждает от магического сна", "сон", True, True),
-            ("Снимает физическую Защиту", "защита", False, False),
-            ("Повышает магическую силу", "сила", True, False),
-            ("Увеличивает удачу", "удача", True, False)
-        ]),
-        ("RK1", "Рогатый Корень", [
-            ("Смертельный Яд", "яд", False, True),
-            ("Вызывает Усталость", "энергия", False, False),
-            ("Понижает скорость", "скорость", False, False),
-            ("Снимает проклятие", "проклятие", True, False)
-        ]),
-        ("SBN2", "Сердце Бугул-Ноза", [
-            ("Вызывает состояние Бодрости", "энергия", True, True),
-            ("Погружает в сон без сновидений", "сон", False, False),
-            ("Увеличивает выносливость", "выносливость", True, False),
-            ("Уменьшает стресс", "стресс", True, False)
-        ]),
-        ("ING03", "Лепесток Вечной Розы", [
-            ("Повышает регенерацию", "регенерация", True, True),
-            ("Снижает усталость", "энергия", True, False),
-            ("Ослабляет концентрацию", "концентрация", False, False)
-        ]),
-        ("ING04", "Пыльца Солнечного Лотоса", [
-            ("Усиливает сопротивление ядам", "яд", True, True),
-            ("Уменьшает удачу", "удача", False, False),
-            ("Повышает скорость", "скорость", True, False)
-        ])
-    ]
-
-    for code, name, props in test_data:
-        cursor.execute(
-            "INSERT INTO ingredients (user_id, code, name) VALUES (?, ?, ?)",
-            (user_id, code, name)
-        )
-        ingredient_id = cursor.lastrowid
-        for desc, eff_type, is_pos, is_main in props:
-            cursor.execute("""
-                INSERT INTO properties (user_id, ingredient_id, description, type, is_positive, is_main)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (user_id, ingredient_id, desc, eff_type, is_pos, is_main))
-
-    conn.commit()
-    conn.close()
 
 
 def get_ingredients(user_id):
@@ -799,7 +695,6 @@ async def craft_optimal(update: Update, context: ContextTypes.DEFAULT_TYPE, mess
 #############################
 
 def main():
-    setup_database()
     token = os.getenv("API_TOKEN")  # настройте переменные окружения
     application = ApplicationBuilder().token(token).build()
 
