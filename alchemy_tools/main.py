@@ -31,6 +31,105 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def ensure_db_tables() -> None:
+    """Create required tables if they are missing."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ingredients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            code TEXT,
+            name TEXT
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS properties (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            ingredient_id INTEGER,
+            description TEXT,
+            type TEXT,
+            is_positive BOOLEAN,
+            is_main BOOLEAN
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            ingredient_ids TEXT,
+            effects TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def populate_test_data_for_user(user_id: int) -> None:
+    """Insert a small set of ingredients for a new user."""
+    ensure_db_tables()
+    if get_ingredients(user_id):
+        return
+
+    samples = [
+        (
+            "ING01",
+            "Корень мандрагоры",
+            "сила",
+            True,
+            [("сонное зелье", "сон", False)],
+        ),
+        (
+            "ING02",
+            "Крыло летучей мыши",
+            "ночное зрение",
+            True,
+            [("слабость", "сила", False)],
+        ),
+        (
+            "ING03",
+            "Ягода можжевельника",
+            "здоровье",
+            True,
+            [("сон", "сон", False)],
+        ),
+    ]
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    for code, name, main_type, main_pos, extras in samples:
+        cursor.execute(
+            "INSERT INTO ingredients (user_id, code, name) VALUES (?, ?, ?)",
+            (user_id, code, name),
+        )
+        ingredient_id = cursor.lastrowid
+        cursor.execute(
+            """
+            INSERT INTO properties (user_id, ingredient_id, description, type, is_positive, is_main)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, ingredient_id, main_type, main_type, main_pos, True),
+        )
+        for desc, eff_type, is_pos in extras:
+            cursor.execute(
+                """
+                INSERT INTO properties (user_id, ingredient_id, description, type, is_positive, is_main)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, ingredient_id, desc, eff_type, is_pos, False),
+            )
+    conn.commit()
+    conn.close()
+
+
 def get_ingredients(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
