@@ -17,10 +17,15 @@ This repository contains a working prototype with basic command handlers and hel
   - `evaluate_ingredients.py` – functions for scoring ingredient formulas
   - `find_ingredients.py` – algorithms for searching optimal ingredient sets
   - `utils.py` – small helpers such as `split_formula`
+  - `recipes.py` – helper to store and retrieve user potion recipes
+  - `user_ingredients.py` – tools to manage a user's ingredient list
 - **tests/** – simple tests for individual helpers
   - `test_evaluate.py` – verifies the effect scoring logic
   - `test_utils.py` – checks utilities
 - `pyproject.toml` / `poetry.lock` – project dependencies for Poetry
+- **analyze_notebooks/** – Jupyter notebooks exploring effect calculation algorithms
+- `reset_db.py` – recreate and populate the SQLite database using `young_alchemy.csv` and `all_effects_df.pkl`
+- `young_alchemy.csv` / `all_effects_df.pkl` – sample data files used for testing
 
 ## Running Tests
 
