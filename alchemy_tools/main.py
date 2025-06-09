@@ -1,7 +1,10 @@
 import os
+from alchemy_tools.find_ingredients import (
+    potential_candidates_with_max_score_several_steps,
+)
 import sqlite3
-import json
 import logging
+from collections import defaultdict
 
 from telegram import (
     Update,
@@ -18,6 +21,17 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+
+from db_fill import user_testing_add_all_ingredients
+from effects_tools import (
+    get_all_properties_by_ingredient_id,
+    get_ingredient_name_by_id,
+    get_properties_by_ingredient_id,
+    get_by_ingredients_with_codes,
+    get_ingredient_id,
+)
+from user_ingredients import select_all_ingredients_by_user
+
 DB_PATH = "alchemy.db"
 
 ############################
@@ -130,100 +144,20 @@ def populate_test_data_for_user(user_id: int) -> None:
     conn.close()
 
 
-def get_ingredients(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, code, name FROM ingredients WHERE user_id = ?", (user_id,))
-    ingredients = cursor.fetchall()
-    conn.close()
-    return ingredients
 
 
-def get_properties_by_ingredient_id(ingredient_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT description, type, is_positive, is_main
-        FROM properties
-        WHERE ingredient_id = ?
-    """, (ingredient_id,))
-    properties = cursor.fetchall()
-    conn.close()
-    return properties
 
 
-def save_recipe(user_id, name, ingredient_ids, effects):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO recipes (user_id, name, ingredient_ids, effects) VALUES (?, ?, ?, ?)",
-        (user_id, name, json.dumps(ingredient_ids), effects)
-    )
-    conn.commit()
-    conn.close()
 
 
-def get_user_recipes(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, ingredient_ids, effects FROM recipes WHERE user_id = ?", (user_id,))
-    recipes = cursor.fetchall()
-    conn.close()
-    return recipes
 
 
-def get_ingredient_name_by_id(ingredient_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM ingredients WHERE id = ?", (ingredient_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else "Неизвестный ингредиент"
 
-
-def get_all_properties_by_ingredient_id(ingredient_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT description, type, is_positive
-        FROM properties
-        WHERE ingredient_id = ? AND is_main = TRUE
-    """, (ingredient_id,))
-    main_property = cursor.fetchone()
-
-    cursor.execute("""
-        SELECT description, type, is_positive
-        FROM properties
-        WHERE ingredient_id = ? AND is_main = FALSE
-    """, (ingredient_id,))
-    additional_properties = cursor.fetchall()
-
-    conn.close()
-    return main_property, additional_properties
-
-
-def recipe_exists(ingredient_ids, selected_effects, user_id):
-    """Проверяем, не существует ли такого же точного рецепта (ингредиенты + эффекты)."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, ingredient_ids, effects FROM recipes WHERE user_id = ?", (user_id,))
-    existing_recipes = cursor.fetchall()
-    conn.close()
-
-    for recipe_id, ingredient_ids_json, effects_text in existing_recipes:
-        existing_ingredient_ids = json.loads(ingredient_ids_json)
-        if sorted(existing_ingredient_ids) == sorted(ingredient_ids):
-            calculated = calculate_potion_effect(ingredient_ids, selected_effects, user_id)
-            current_effects_text = "\n".join([f"{k}: {v}" for k, v in calculated.items()])
-            if current_effects_text == effects_text:
-                return True
-    return False
-
-
-def calculate_potion_effect(ingredient_ids, selected_effects, user_id):
+def calculate_potion_effect(ingredient_ids, selected_effects):
     """Вычисляем итоговые эффекты зелья с учётом компенсаций."""
-    effects = {}
+    all_effects_result = ""
+    not_compensated_effects = []
+    effects = defaultdict(lambda :0)
     used_ingredients = set()
 
     for ingredient_id in ingredient_ids:
@@ -231,20 +165,44 @@ def calculate_potion_effect(ingredient_ids, selected_effects, user_id):
             continue
         main_property, _ = get_all_properties_by_ingredient_id(ingredient_id)
         if main_property:
-            _, effect_type, is_positive = main_property
-            effects[effect_type] = 1 if is_positive else -1
-            used_ingredients.add(ingredient_id)
+            ing_code,effect_description, effect_type, effect_value = main_property
+            all_effects_result += f"{ing_code} Главный эффект: {effect_description}"
+            if effect_type is not None:
+                all_effects_result += f" ({effect_type}: {effect_value})"
+                effects[effect_type] += effect_value
+                used_ingredients.add(ingredient_id)
+            else:
+                not_compensated_effects.append(effect_description)
+            all_effects_result += "\n"
 
     for ingredient_id in ingredient_ids:
         if ingredient_id not in selected_effects:
             continue
         _, additional_properties = get_all_properties_by_ingredient_id(ingredient_id)
         effect_index = selected_effects[ingredient_id]
-        if effect_index < len(additional_properties):
-            _, effect_type, is_positive = additional_properties[effect_index]
-            effects[effect_type] = effects.get(effect_type, 0) + (1 if is_positive else -1)
+        ing_code,effect_description, effect_type, effect_value = additional_properties[effect_index]
+        all_effects_result += f"{ing_code} Дополнительный эффект: {effect_description}"
+        if effect_type is not None:
+            all_effects_result += f" ({effect_type}: {effect_value})"
+            effects[effect_type] += effect_value
+            used_ingredients.add(ingredient_id)
+        else:
+            not_compensated_effects.append(effect_description)
+        all_effects_result += "\n"
+        
+    if effects:
+        all_effects_result += "\nКомпенсированные эффекты:\n"
+        for effect_type, value in effects.items():
+            all_effects_result += f"{effect_type}: {value}\n"
+    if not_compensated_effects:
+        all_effects_result += "\nНекомпенсированные эффекты:\n"
+        for effect in not_compensated_effects:
+            all_effects_result += f"- {effect}\n"
+    
+    if len(not_compensated_effects) + len(effects) >=5:
+        all_effects_result += "\n\nВнимание! Зелье имеет слишком много некомпенсированных эффектов. Будет взрыв."
 
-    return effects
+    return all_effects_result
 
 
 def find_optimal_ingredients(desired_effect, user_id):
@@ -271,7 +229,7 @@ def find_optimal_ingredients(desired_effect, user_id):
         for i in range(len(others)):
             for j in range(i + 1, len(others)):
                 ingredient_ids = [base_id, others[i], others[j]]
-                effects = calculate_potion_effect(ingredient_ids, {}, user_id)
+                effects = calculate_potion_effect(ingredient_ids, {})
 
                 if effects.get(desired_effect, 0) <= 0:
                     continue
@@ -286,17 +244,6 @@ def find_optimal_ingredients(desired_effect, user_id):
     return best_combination
 
 
-def add_user_ingredient(user_id, code, name, main_desc, main_type, main_positive):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO ingredients (user_id, code, name) VALUES (?, ?, ?)", (user_id, code, name))
-    ingredient_id = cursor.lastrowid
-    cursor.execute("""
-        INSERT INTO properties (user_id, ingredient_id, description, type, is_positive, is_main)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, ingredient_id, main_desc, main_type, main_positive, True))
-    conn.commit()
-    conn.close()
 
 
 ##############################
@@ -314,9 +261,8 @@ def get_user_id(update: Update):
 def main_menu_keyboard():
     """Постоянное меню внизу экрана Telegram."""
     keyboard = [
-        [KeyboardButton("/craft"), KeyboardButton("/my_recipes")],
-        [KeyboardButton("/delete_recipe"), KeyboardButton("/rename_recipe")],
-        [KeyboardButton("/craft_optimal"), KeyboardButton("/help")],
+        [KeyboardButton("/craft") ],
+        [KeyboardButton("/craft_optimal_from_formula"), KeyboardButton("/help")],
         [KeyboardButton("/list_ingredients"), KeyboardButton("/add_ingredient")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -333,11 +279,11 @@ async def show_selected_ingredients(user_id: int, selected_ids: list[int]) -> st
     return "Выбранные ингредиенты:\n- " + "\n- ".join(selected_ingredients) + "\n\nВыберите ещё или закончите подбор."
 
 async def create_ingredients_keyboard(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    ingredients = get_ingredients(user_id)
+    ingredients = select_all_ingredients_by_user(user_id)
     keyboard = []
     selected_ingredients = context.user_data.get("ingredient_ids", [])
 
-    for ingredient_id, code, name in ingredients:
+    for ingredient_id, code, ingredient_type, material_analog, name in ingredients:
         if ingredient_id not in selected_ingredients:
             keyboard.append([InlineKeyboardButton(name, callback_data=f"add_{ingredient_id}")])
 
@@ -353,12 +299,12 @@ async def create_effects_keyboard(ingredient_id: int):
 
     # Доп. свойства
     for idx, prop in enumerate(additional_properties):
-        desc, eff_type, is_pos = prop
-        sign = "+" if is_pos else "-"
-        text_btn = f"{desc} ({eff_type}: {sign})"
+        _,desc, eff_type, effect_value = prop
+        text_btn = f"{desc} "
+        if eff_type is not None:
+            text_btn += f" ({eff_type}: {effect_value})"
         keyboard.append([InlineKeyboardButton(text_btn, callback_data=f"chooseeff_{ingredient_id}_{idx}")])
 
-    keyboard.append([InlineKeyboardButton("Без доп. эффекта", callback_data=f"chooseeff_{ingredient_id}_no")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -366,43 +312,39 @@ async def create_effects_keyboard(ingredient_id: int):
 # ОБРАБОТЧИКИ КОМАНД    #
 #########################
 
-async def add_ingredient(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
-    if message is None:
-        message = update.message
-    context.user_data["adding_ingredient_step"] = "code"
-    await message.reply_text("Введите код нового ингредиента (например 'ING01'):")
 
 async def list_ingredients(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
     if message is None:
         message = update.message
     user_id = get_user_id(update)
-    ingredients = get_ingredients(user_id)
-
-    if not ingredients:
-        populate_test_data_for_user(user_id)
-        ingredients = get_ingredients(user_id)
+    ingredients = select_all_ingredients_by_user(user_id)
 
     if not ingredients:
         await message.reply_text("У вас нет ингредиентов.", reply_markup=main_menu_keyboard())
+        user_testing_add_all_ingredients(user_id)
         return
 
     text = "Ваши ингредиенты:\n"
-    for ing_id, code, name in ingredients:
+    for ing_id, code, ingredient_type, material_analog, name in ingredients:
         text += f"{code}: {name}\n"
+        text += f" Тип: {ingredient_type}| Материальный аналог {material_analog}\n"
         props = get_properties_by_ingredient_id(ing_id)
         if props:
             text += "Эффекты:\n"
-            for desc, eff_type, is_pos, is_main in props:
-                sign = "+" if is_pos else "-"
-                main_str = "(ГЛАВН.) " if is_main else ""
-                text += f" - {main_str}{desc} ({eff_type}: {sign})\n"
+            for desc, eff_type, value, ing_order in props:
+                sign = f" {value} "
+                main_str = "Основной: " if ing_order==0 else f"{ing_order} "
+                text += f"{main_str}{desc}"
+                if eff_type is not None:
+                    text+= f" ({eff_type}: {sign})"
+                text += "\n"
         text += "\n"
 
-    await message.reply_text(text, reply_markup=main_menu_keyboard())
+    await message.reply_text(text[:4000], reply_markup=main_menu_keyboard())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_user_id(update)
-    populate_test_data_for_user(user_id)
+    user_testing_add_all_ingredients(user_id)
     context.user_data["ingredient_ids"] = []
     await update.message.reply_text(
         "Добро пожаловать в алхимический помощник!\n"
@@ -414,14 +356,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [
-            InlineKeyboardButton("Создать зелье", callback_data="help_craft"),
-            InlineKeyboardButton("Мои рецепты", callback_data="help_recipes")
-        ],
-        [
-            InlineKeyboardButton("Удалить рецепт", callback_data="help_delete"),
-            InlineKeyboardButton("Переименовать рецепт", callback_data="help_rename")
-        ],
-        [
             InlineKeyboardButton("Оптимальный подбор", callback_data="help_optimal")
         ],
         [
@@ -432,11 +366,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         "Доступные команды:\n"
-        "/craft - Создать новое зелье\n"
-        "/my_recipes - Посмотреть сохраненные рецепты\n"
-        "/delete_recipe - Удалить рецепт\n"
-        "/rename_recipe - Переименовать рецепт\n"
-        "/craft_optimal <эффект> - Подобрать оптимальное зелье\n"
+        "/craft - Создать зелье\n"
+        "/craft_optimal_from_formula <формула> - Подобрать оптимальное зелье по формуле\n"
         "/list_ingredients - Показать список ваших ингредиентов\n"
         "/add_ingredient - Добавить новый ингредиент\n",
         reply_markup=reply_markup
@@ -455,25 +386,18 @@ async def handle_help_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         if query.data == "help_craft":
             await craft(update, context, message=message)
-        elif query.data == "help_recipes":
-            await my_recipes(update, context, message=message)
-        elif query.data == "help_delete":
-            await delete_recipe(update, context, message=message)
-        elif query.data == "help_rename":
-            await rename_recipe(update, context, message=message)
         elif query.data == "help_optimal":
             await query.message.reply_text(
-                "Введите команду /craft_optimal <желаемый_эффект>\n"
-                "Например: /craft_optimal сила"
+                "Введите команду /craft_optimal_from_formula <формула> <количество ингредиентов, которые нужно добавить>\n"
+                "Например: /craft_optimal_from_formula MA2,RK2 2",
+                reply_markup=main_menu_keyboard()
             )
         elif query.data == "help_list_ing":
             await list_ingredients(update, context, message=message)
-        elif query.data == "help_add_ing":
-            await add_ingredient(update, context, message=message)
 
     except Exception as e:
         logger.error(f"handle_help_buttons error {e}")
-        await query.message.reply_text(f"Произошла ошибка: {str(e)}")
+        await query.message.reply_text(f"Произошла ошибка: {str(e)}", reply_markup=main_menu_keyboard())
 
 
 async def craft(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
@@ -505,7 +429,7 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("add_"):
         ingredient_id = int(data.replace("add_", ""))
         if ingredient_id in context.user_data.get("ingredient_ids", []):
-            await query.message.reply_text("Этот ингредиент уже добавлен!")
+            await query.message.reply_text("Этот ингредиент уже добавлен!", reply_markup=main_menu_keyboard())
             return
         reply_markup = await create_effects_keyboard(ingredient_id)
         await query.edit_message_text(
@@ -518,20 +442,16 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "done":
         ingredient_ids = context.user_data.get("ingredient_ids", [])
         if len(ingredient_ids) < 3:
-            await query.message.reply_text("В зелье должно быть минимум 3 ингредиента!")
+            await query.message.reply_text("В зелье должно быть минимум 3 ингредиента!", reply_markup=main_menu_keyboard())
             return
         if len(set(ingredient_ids)) != len(ingredient_ids):
-            await query.message.reply_text("В зелье не должно быть повторяющихся ингредиентов!")
+            await query.message.reply_text("В зелье не должно быть повторяющихся ингредиентов!", reply_markup=main_menu_keyboard())
             return
 
-        effects = calculate_potion_effect(ingredient_ids, context.user_data.get("selected_effects", {}), user_id)
-        effects_text = "\n".join([f"{k}: {v}" for k, v in effects.items()])
-
-        keyboard = [[InlineKeyboardButton("Сохранить рецепт", callback_data="save_recipe")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        effects_result_text = calculate_potion_effect(ingredient_ids, context.user_data.get("selected_effects", {}))
         await query.edit_message_text(
-            f"Ваше зелье готово!\n\nЭффекты:\n{effects_text}",
-            reply_markup=reply_markup
+            f"Рассчитанные эффекты:\n{effects_result_text}",
+            reply_markup=main_menu_keyboard()
         )
 
     if data.startswith("chooseeff_"):
@@ -549,130 +469,9 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup = await create_ingredients_keyboard(user_id, context)
         message_text = await show_selected_ingredients(user_id, ingredient_ids)
         await query.edit_message_text(text=message_text, reply_markup=reply_markup)
+        # Добавляем сообщение с обновленной клавиатурой
+        await query.message.reply_text("Ингредиент добавлен.", reply_markup=main_menu_keyboard())
 
-
-async def handle_save_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user_id = get_user_id(update)
-
-    if query.data == "save_recipe":
-        ingredient_ids = context.user_data.get("ingredient_ids", [])
-        selected_effects = context.user_data.get("selected_effects", {})
-
-        if len(ingredient_ids) < 3:
-            await query.message.reply_text("В зелье минимум 3 ингредиента!")
-            return
-
-        effects = calculate_potion_effect(ingredient_ids, selected_effects, user_id)
-        effects_text = "\n".join([f"{key}: {value}" for key, value in effects.items()])
-
-        if recipe_exists(ingredient_ids, selected_effects, user_id):
-            await query.edit_message_text("Такой рецепт уже существует!")
-            return
-
-        context.user_data["pending_save"] = {
-            "user_id": user_id,
-            "ingredient_ids": ingredient_ids,
-            "effects_text": effects_text
-        }
-        await query.edit_message_text("Введите название для вашего рецепта:")
-
-
-async def handle_recipe_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = get_user_id(update)
-    if "pending_save" in context.user_data:
-        recipe_name = update.message.text
-        data = context.user_data["pending_save"]
-
-        if recipe_exists(data["ingredient_ids"], context.user_data.get("selected_effects", {}), user_id):
-            await update.message.reply_text("Такой рецепт уже существует!")
-            return
-
-        save_recipe(
-            user_id=data["user_id"],
-            name=recipe_name,
-            ingredient_ids=data["ingredient_ids"],
-            effects=data["effects_text"]
-        )
-        await update.message.reply_text(f"Рецепт '{recipe_name}' сохранён!", reply_markup=main_menu_keyboard())
-        del context.user_data["pending_save"]
-    else:
-        await update.message.reply_text("Команда не распознана. Введите /help для списка команд.")
-
-
-async def my_recipes(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
-    if message is None:
-        message = update.message
-    user_id = get_user_id(update)
-    recipes = get_user_recipes(user_id)
-    if not recipes:
-        await message.reply_text("У вас ещё нет сохранённых рецептов.", reply_markup=main_menu_keyboard())
-        return
-
-    response = "Ваши рецепты:\n"
-    for recipe_id, name, ingredient_ids_json, effects in recipes:
-        ingredient_ids = json.loads(ingredient_ids_json)
-        ingredients = [get_ingredient_name_by_id(iid) for iid in ingredient_ids]
-        ingredients_text = ", ".join(ingredients)
-        response += f"\nНазвание: {name}\nИнгредиенты: {ingredients_text}\nЭффекты:\n{effects}\n"
-
-    await message.reply_text(response, reply_markup=main_menu_keyboard())
-
-
-async def delete_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
-    if message is None:
-        message = update.message
-    user_id = get_user_id(update)
-    recipes = get_user_recipes(user_id)
-    if not recipes:
-        await message.reply_text("У вас нет сохраненных рецептов.", reply_markup=main_menu_keyboard())
-        return
-
-    keyboard = []
-    for recipe_id, name, _, _ in recipes:
-        keyboard.append([InlineKeyboardButton(f"Удалить: {name}", callback_data=f"delete_{recipe_id}")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await message.reply_text("Выберите рецепт для удаления:", reply_markup=reply_markup)
-
-
-async def rename_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
-    if message is None:
-        message = update.message
-    user_id = get_user_id(update)
-    recipes = get_user_recipes(user_id)
-    if not recipes:
-        await message.reply_text("У вас нет сохраненных рецептов.", reply_markup=main_menu_keyboard())
-        return
-
-    keyboard = []
-    for recipe_id, name, _, _ in recipes:
-        keyboard.append([InlineKeyboardButton(f"Переименовать: {name}", callback_data=f"rename_{recipe_id}")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await message.reply_text("Выберите рецепт для переименования:", reply_markup=reply_markup)
-
-
-async def handle_recipe_action(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
-    if message is None:
-        message = update.callback_query.message
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = get_user_id(update)
-
-    if data.startswith("delete_"):
-        recipe_id = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM recipes WHERE id = ? AND user_id = ?", (recipe_id, user_id))
-        conn.commit()
-        conn.close()
-        await query.edit_message_text("Рецепт успешно удален!", reply_markup=main_menu_keyboard())
-
-    elif data.startswith("rename_"):
-        recipe_id = int(data.split("_")[1])
-        context.user_data["renaming_recipe"] = recipe_id
-        await query.edit_message_text("Введите новое название для рецепта:")
 
 
 #########################
@@ -684,66 +483,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, messag
         message = update.message
     user_id = get_user_id(update)
 
-    # Сохранение рецепта
-    if "pending_save" in context.user_data:
-        await handle_recipe_name(update, context)
-        return
-
-    # Переименование рецепта
-    if "renaming_recipe" in context.user_data:
-        new_name = update.message.text
-        recipe_id = context.user_data["renaming_recipe"]
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE recipes SET name = ? WHERE id = ? AND user_id = ?", (new_name, recipe_id, user_id))
-        conn.commit()
-        conn.close()
-
-        await message.reply_text(f"Рецепт переименован в '{new_name}'!", reply_markup=main_menu_keyboard())
-        del context.user_data["renaming_recipe"]
-        return
-
-    # Добавление ингредиента по шагам
-    if "adding_ingredient_step" in context.user_data:
-        step = context.user_data["adding_ingredient_step"]
-        if step == "code":
-            context.user_data["new_ingredient_code"] = update.message.text.strip()
-            context.user_data["adding_ingredient_step"] = "name"
-            await message.reply_text("Введите название нового ингредиента:")
-            return
-        elif step == "name":
-            context.user_data["new_ingredient_name"] = update.message.text.strip()
-            context.user_data["adding_ingredient_step"] = "main_desc"
-            await message.reply_text("Введите описание главного свойства ингредиента:")
-            return
-        elif step == "main_desc":
-            context.user_data["new_ingredient_main_desc"] = update.message.text.strip()
-            context.user_data["adding_ingredient_step"] = "main_type"
-            await message.reply_text("Введите тип главного свойства (например, 'сила', 'сон', 'защита'):")
-            return
-        elif step == "main_type":
-            context.user_data["new_ingredient_main_type"] = update.message.text.strip()
-            context.user_data["adding_ingredient_step"] = "main_positive"
-            await message.reply_text("Главное свойство положительное? Введите 'да' или 'нет':")
-            return
-        elif step == "main_positive":
-            ans = update.message.text.strip().lower()
-            is_positive = ans in ["да", "yes", "д", "y"]
-            code = context.user_data["new_ingredient_code"]
-            name = context.user_data["new_ingredient_name"]
-            desc = context.user_data["new_ingredient_main_desc"]
-            t = context.user_data["new_ingredient_main_type"]
-            add_user_ingredient(user_id, code, name, desc, t, is_positive)
-
-            # Очищаем временные данные
-            del context.user_data["adding_ingredient_step"]
-            del context.user_data["new_ingredient_code"]
-            del context.user_data["new_ingredient_name"]
-            del context.user_data["new_ingredient_main_desc"]
-            del context.user_data["new_ingredient_main_type"]
-
-            await message.reply_text(f"Ингредиент '{name}' добавлен!", reply_markup=main_menu_keyboard())
-            return
 
     # Неизвестный ввод
     await message.reply_text("Команда не распознана. Введите /help для списка команд.",
@@ -754,14 +493,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, messag
 # ОПТИМАЛЬНОЕ ЗЕЛЬЕ     #
 #########################
 
-async def craft_optimal(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
+async def craft_optimal_with_effect(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
     if message is None:
         message = update.message
     user_id = get_user_id(update)
 
     if len(context.args) == 0:
         await message.reply_text(
-            "Укажите желаемый эффект, например: /craft_optimal сила",
+            "Укажите желаемый эффект, например: /craft_optimal_with_effect сила",
             reply_markup=main_menu_keyboard()
         )
         return
@@ -788,6 +527,82 @@ async def craft_optimal(update: Update, context: ContextTypes.DEFAULT_TYPE, mess
         reply_markup=main_menu_keyboard()
     )
 
+async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
+    if message is None:
+        message = update.message
+    user_id = get_user_id(update)
+
+    if len(context.args) == 0:
+        await message.reply_text(
+            "Укажите формулу зелья, например: /craft_optimal_from_formula VZ3,SA1",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    formula_text = context.args[0]
+    steps = 1
+    if len(context.args) > 1:
+        try:
+            steps = int(context.args[1])
+        except ValueError:
+            await message.reply_text(
+                "Количество шагов должно быть целым числом",
+                reply_markup=main_menu_keyboard()
+            )
+            return
+    
+    formula = formula_text.split(',')
+
+    try:
+        result_formulas = potential_candidates_with_max_score_several_steps(
+            formula=formula, 
+            steps=steps, 
+            only_max_score=True, 
+            user_id=user_id
+        )
+        
+        if not result_formulas:
+            await message.reply_text(
+                f"Не удалось найти оптимальные варианты для формулы '{formula_text}'",
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        
+        result_text = "Оптимальные варианты формулы:\n\n"
+        
+        for i, result_formula in enumerate(result_formulas[:5]):  # Ограничиваем вывод 5 результатами
+            ingredient_ids = []
+            selected_effects = {}
+
+            # all_formula_effects_df = get_by_ingredients_with_codes(ingredients_with_codes=result_formula)
+
+            for ingredient_code_order in result_formula:
+                ingredient_code=ingredient_code_order[:-1]
+                ingredient_order=int(ingredient_code_order[-1])
+                ingredient_id=get_ingredient_id(ingredient_code=ingredient_code)
+                ingredient_ids.append(ingredient_id)
+                selected_effects[ingredient_id]=ingredient_order-1
+            effects_result = calculate_potion_effect(ingredient_ids, selected_effects)
+            
+            result_text += f"Вариант {i+1}:\n"
+            result_text += f"Формула: {','.join(result_formula)}\n"
+            result_text += f"Эффекты:\n{effects_result}\n\n"
+            
+            if len(result_text) > 3500:  # Ограничиваем длину сообщения
+                result_text += "Показаны не все варианты из-за ограничения длины сообщения."
+                break
+        
+        await message.reply_text(
+            result_text,
+            reply_markup=main_menu_keyboard()
+        )
+    
+    except Exception as e:
+        logger.error(f"Error in craft_optimal_from_formula: {e}")
+        await message.reply_text(
+            f"Произошла ошибка при обработке формулы: {str(e)}",
+            reply_markup=main_menu_keyboard()
+        )
 
 #############################
 # ОСНОВНАЯ ФУНКЦИЯ MAIN     #
@@ -801,17 +616,12 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("craft", craft))
-    application.add_handler(CommandHandler("my_recipes", my_recipes))
-    application.add_handler(CommandHandler("delete_recipe", delete_recipe))
-    application.add_handler(CommandHandler("rename_recipe", rename_recipe))
-    application.add_handler(CommandHandler("craft_optimal", craft_optimal))
+    application.add_handler(CommandHandler("craft_optimal_with_effect", craft_optimal_with_effect))
+    application.add_handler(CommandHandler("craft_optimal_from_formula", craft_optimal_from_formula))
     application.add_handler(CommandHandler("list_ingredients", list_ingredients))
-    application.add_handler(CommandHandler("add_ingredient", add_ingredient))
 
     # Callback
     application.add_handler(CallbackQueryHandler(handle_help_buttons, pattern="^help_"))
-    application.add_handler(CallbackQueryHandler(handle_save_recipe, pattern="^save_recipe$"))
-    application.add_handler(CallbackQueryHandler(handle_recipe_action, pattern="^(delete_|rename_)"))
     application.add_handler(CallbackQueryHandler(ingredient_selection, pattern="^(reset|add_|done|chooseeff_)"))
 
     # Текстовые сообщения

@@ -21,7 +21,6 @@ def evaluate_effects(all_effects_df):
         else:
             score-=100
     return score
-@db_alchemy_wrapper
 def calculate_score_by_formula(formula,cursor):
-    all_effects_df = get_by_ingredients_with_codes(formula,cursor)
+    all_effects_df = get_by_ingredients_with_codes(formula,cursor=cursor)
     return evaluate_effects(all_effects_df)

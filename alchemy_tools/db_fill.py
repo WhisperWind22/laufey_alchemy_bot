@@ -1,4 +1,3 @@
-import pandas as pd
 import sqlite3
 DB_PATH = "alchemy.db"
 MATERIAL_TYPES = ["Магические Металлы","Магические Компоненты","Травы"]
@@ -101,9 +100,20 @@ def fill_ingredients_table(young_alchemy_data):
             conn.commit()
     conn.close()
 
-def main():
-    young_alchemy_data = pd.read_csv("young_alchemy.csv")
-    fill_ingredients_table(young_alchemy_data)
+def user_testing_add_all_ingredients(user_id:int=0):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO user_ingredients (user_id, ingredient_id)
+    SELECT ?, i.id
+    FROM ingredients i
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM user_ingredients ui
+        WHERE ui.user_id = ?
+          AND ui.ingredient_id = i.id
+    );
+    """,(user_id,user_id))
+    conn.commit()
+    cursor.close()
 
-if __name__ == "__main__":
-    main()

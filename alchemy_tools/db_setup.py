@@ -1,20 +1,10 @@
-import os
 import sqlite3
-import pandas as pd
-DB_PATH = "alchemy.db"
+from pathlib import Path
+DB_PATH = Path("./alchemy.db")
 
 def setup_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_ingredients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            ingridient_code TEXT,
-            material_type TEXT,
-            UNIQUE(user_id, ingridient_code)
-        )
-    """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ingredients (
@@ -66,6 +56,15 @@ def setup_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_ingredients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            ingredient_id INTEGER,
+            FOREIGN KEY (ingredient_id) REFERENCES ingredients(id),
+            UNIQUE(user_id, ingredient_id)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -83,13 +82,3 @@ def add_effects_to_db(effects_df):
     conn.commit()
     conn.close()
 
-def main():
-    if os.path.exists(DB_PATH):
-        print("DB deleted")
-        os.remove(DB_PATH)
-    setup_database()
-    effects_df = pd.read_pickle("all_effects_df.pkl")
-    add_effects_to_db(effects_df)
-
-if __name__ == "__main__":
-    main()
