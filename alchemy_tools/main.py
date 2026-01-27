@@ -22,15 +22,17 @@ from telegram.ext import (
     filters
 )
 
-from db_fill import user_testing_add_all_ingredients
-from effects_tools import (
+from alchemy_tools.db_fill import user_testing_add_all_ingredients
+from alchemy_tools.effects_tools import (
     get_all_properties_by_ingredient_id,
     get_ingredient_name_by_id,
     get_properties_by_ingredient_id,
     get_by_ingredients_with_codes,
     get_ingredient_id,
+    search_effects_by_description,
 )
-from user_ingredients import select_all_ingredients_by_user
+from alchemy_tools.user_ingredients import select_all_ingredients_by_user
+from alchemy_tools.user_settings import get_max_ingredients, set_max_ingredients
 
 DB_PATH = "alchemy.db"
 
@@ -39,10 +41,43 @@ DB_PATH = "alchemy.db"
 ############################
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _shorten_text(text: str, limit: int = 500) -> str:
+    if not text:
+        return ""
+    text = text.replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _summarize_update(update: Update) -> str:
+    user_id = update.effective_user.id if update.effective_user else None
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    message_id = update.effective_message.message_id if update.effective_message else None
+
+    if update.message:
+        content = update.message.text or update.message.caption or ""
+        kind = "message"
+    elif update.edited_message:
+        content = update.edited_message.text or update.edited_message.caption or ""
+        kind = "edited_message"
+    elif update.callback_query:
+        content = update.callback_query.data or ""
+        kind = "callback_query"
+    else:
+        content = ""
+        kind = "other"
+
+    return (
+        f"type={kind} user_id={user_id} chat_id={chat_id} "
+        f"message_id={message_id} text='{_shorten_text(content)}'"
+    )
 
 
 def ensure_db_tables() -> None:
@@ -262,7 +297,9 @@ def main_menu_keyboard():
     """Постоянное меню внизу экрана Telegram."""
     keyboard = [
         [KeyboardButton("/craft") ],
+        [KeyboardButton("/craft_optimal_with_effect")],
         [KeyboardButton("/craft_optimal_from_formula"), KeyboardButton("/help")],
+        [KeyboardButton("/settings")],
         [KeyboardButton("/list_ingredients"), KeyboardButton("/add_ingredient")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -279,6 +316,8 @@ async def show_selected_ingredients(user_id: int, selected_ids: list[int]) -> st
     return "Выбранные ингредиенты:\n- " + "\n- ".join(selected_ingredients) + "\n\nВыберите ещё или закончите подбор."
 
 async def create_ingredients_keyboard(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    # Ensure users always have access to all ingredients.
+    user_testing_add_all_ingredients(user_id)
     ingredients = select_all_ingredients_by_user(user_id)
     keyboard = []
     selected_ingredients = context.user_data.get("ingredient_ids", [])
@@ -317,11 +356,10 @@ async def list_ingredients(update: Update, context: ContextTypes.DEFAULT_TYPE, m
     if message is None:
         message = update.message
     user_id = get_user_id(update)
+    user_testing_add_all_ingredients(user_id)
     ingredients = select_all_ingredients_by_user(user_id)
-
     if not ingredients:
         await message.reply_text("У вас нет ингредиентов.", reply_markup=main_menu_keyboard())
-        user_testing_add_all_ingredients(user_id)
         return
 
     text = "Ваши ингредиенты:\n"
@@ -341,6 +379,112 @@ async def list_ingredients(update: Update, context: ContextTypes.DEFAULT_TYPE, m
         text += "\n"
 
     await message.reply_text(text[:4000], reply_markup=main_menu_keyboard())
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
+    if message is None:
+        message = update.message
+    user_id = get_user_id(update)
+    current_max = get_max_ingredients(user_id, default=3)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Макс 3", callback_data="setmax_3"),
+                InlineKeyboardButton("Макс 5", callback_data="setmax_5"),
+            ]
+        ]
+    )
+    await message.reply_text(
+        f"Настройки подбора ингредиентов.\nТекущий лимит: до {current_max} ингредиентов.",
+        reply_markup=keyboard,
+    )
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = get_user_id(update)
+    data = query.data or ""
+    if data == "setmax_3":
+        set_max_ingredients(user_id, 3)
+        await query.edit_message_text(
+            "Лимит подбора установлен: до 3 ингредиентов.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    if data == "setmax_5":
+        set_max_ingredients(user_id, 5)
+        await query.edit_message_text(
+            "Лимит подбора установлен: до 5 ингредиентов.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+
+async def search_effects(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
+    if message is None:
+        message = update.message
+    user_id = get_user_id(update)
+    user_testing_add_all_ingredients(user_id)
+
+    if len(context.args) == 0:
+        await message.reply_text(
+            "Укажите часть названия эффекта, например: /search_effects яд",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    query = " ".join(context.args).strip().lower()
+    if len(query) < 2:
+        await message.reply_text(
+            "Запрос слишком короткий. Укажите минимум 2 символа.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    rows = search_effects_by_description(query, user_id=user_id)
+    if not rows:
+        await message.reply_text(
+            f"Эффекты по запросу '{query}' не найдены.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    max_effects = 15
+    max_ingredients = 6
+    effects = {}
+    for desc, eff_type, value, ing_name, ing_code, ing_order, is_main in rows:
+        key = (desc, eff_type, value)
+        if key not in effects:
+            if len(effects) >= max_effects:
+                continue
+            effects[key] = {"ingredients": [], "total": 0}
+        effects[key]["total"] += 1
+        if len(effects[key]["ingredients"]) < max_ingredients:
+            if ing_order == 0 or is_main:
+                role = "главный"
+            else:
+                role = f"доп. #{ing_order}"
+            effects[key]["ingredients"].append((ing_name, ing_code, role))
+
+    text = f"Эффекты по запросу '{query}':\n"
+    for (desc, eff_type, value), data in effects.items():
+        if eff_type is not None and value is not None:
+            type_part = f" ({eff_type}: {value:+d})"
+        elif eff_type is not None:
+            type_part = f" ({eff_type})"
+        else:
+            type_part = ""
+        ingredients = ", ".join([f"{name} ({code}, {role})" for name, code, role in data["ingredients"]])
+        more = data["total"] - len(data["ingredients"])
+        if more > 0:
+            ingredients += f" и ещё {more}"
+        text += f"\n{desc}{type_part}\nИнгредиенты: {ingredients}\n"
+        if len(text) > 3500:
+            text += "\nПоказаны не все результаты из-за ограничения длины сообщения."
+            break
+
+    await message.reply_text(text, reply_markup=main_menu_keyboard())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_user_id(update)
@@ -367,7 +511,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "Доступные команды:\n"
         "/craft - Создать зелье\n"
+        "/craft_optimal_with_effect <эффект> - Подобрать оптимальное зелье по эффекту\n"
         "/craft_optimal_from_formula <формула> - Подобрать оптимальное зелье по формуле\n"
+        "/craft_optimal <формула> - Синоним команды /craft_optimal_from_formula\n"
+        "/settings - Настройки подбора ингредиентов\n"
+        "/search_effects <текст> - Поиск эффектов по части слова\n"
         "/list_ingredients - Показать список ваших ингредиентов\n"
         "/add_ingredient - Добавить новый ингредиент\n",
         reply_markup=reply_markup
@@ -404,6 +552,7 @@ async def craft(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None
     if message is None:
         message = update.message
     user_id = get_user_id(update)
+    user_testing_add_all_ingredients(user_id)
     context.user_data["ingredient_ids"] = []
     context.user_data["selected_effects"] = {}
 
@@ -489,6 +638,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, messag
                              reply_markup=main_menu_keyboard())
 
 
+async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("update: %s", _summarize_update(update))
+
+
+async def log_callback_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("callback: %s", _summarize_update(update))
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(update, Update):
+        logger.exception("unhandled error on update: %s", _summarize_update(update), exc_info=context.error)
+    else:
+        logger.exception("unhandled error on update: %s", update, exc_info=context.error)
+
+
 #########################
 # ОПТИМАЛЬНОЕ ЗЕЛЬЕ     #
 #########################
@@ -552,6 +716,24 @@ async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAU
             return
     
     formula = formula_text.split(',')
+    max_ingredients = get_max_ingredients(user_id, default=3)
+    if len(formula) >= max_ingredients:
+        await message.reply_text(
+            f"Формула уже содержит {len(formula)} ингредиентов. "
+            f"Лимит подбора: до {max_ingredients} ингредиентов.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    max_steps_allowed = max_ingredients - len(formula) - 1
+    if steps > max_steps_allowed:
+        steps = max_steps_allowed
+        if steps < 0:
+            steps = 0
+        await message.reply_text(
+            f"Ограничиваю подбор по настройкам: до {max_ingredients} ингредиентов.",
+            reply_markup=main_menu_keyboard(),
+        )
 
     try:
         result_formulas = potential_candidates_with_max_score_several_steps(
@@ -568,6 +750,14 @@ async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAU
             )
             return
         
+        result_formulas = [f for f in result_formulas if len(f) <= max_ingredients]
+        if not result_formulas:
+            await message.reply_text(
+                f"Не удалось найти варианты в пределах {max_ingredients} ингредиентов.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
         result_text = "Оптимальные варианты формулы:\n\n"
         
         for i, result_formula in enumerate(result_formulas[:5]):  # Ограничиваем вывод 5 результатами
@@ -613,15 +803,21 @@ def main():
     application = ApplicationBuilder().token(token).build()
 
     # Команды
+    application.add_handler(MessageHandler(filters.ALL, log_all_updates, block=False), group=-1)
+    application.add_handler(CallbackQueryHandler(log_callback_updates, pattern=".*", block=False), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("craft", craft))
     application.add_handler(CommandHandler("craft_optimal_with_effect", craft_optimal_with_effect))
     application.add_handler(CommandHandler("craft_optimal_from_formula", craft_optimal_from_formula))
+    application.add_handler(CommandHandler("craft_optimal", craft_optimal_from_formula))
     application.add_handler(CommandHandler("list_ingredients", list_ingredients))
+    application.add_handler(CommandHandler("search_effects", search_effects))
+    application.add_handler(CommandHandler("settings", settings_command))
 
     # Callback
     application.add_handler(CallbackQueryHandler(handle_help_buttons, pattern="^help_"))
+    application.add_handler(CallbackQueryHandler(settings_callback, pattern="^setmax_"))
     application.add_handler(CallbackQueryHandler(ingredient_selection, pattern="^(reset|add_|done|chooseeff_)"))
 
     # Текстовые сообщения
@@ -630,6 +826,7 @@ def main():
     # Нераспознанные команды
     application.add_handler(MessageHandler(filters.COMMAND, handle_help_buttons))
 
+    application.add_error_handler(error_handler)
     application.run_polling()
 
 if __name__ == "__main__":

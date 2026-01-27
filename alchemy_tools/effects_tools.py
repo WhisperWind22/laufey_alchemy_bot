@@ -104,3 +104,31 @@ def get_ingredient_id(ingredient_code,cursor)->int:
 	""",(ingredient_code,))
     ingredient_id=cursor.fetchone()[0]
     return ingredient_id
+
+
+def search_effects_by_description(query: str, user_id: int, limit: int = 1000):
+    """Search effects by partial text and return matching effects with ingredient role details."""
+    query = query.strip().lower()
+    if not query:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT e.description, et."type", et.value, i.name, i.code, p.ingredient_order, p.is_main
+        FROM effects e
+        JOIN properties p ON e.id = p.effect_id
+        JOIN ingredients i ON i.id = p.ingredient_id
+        JOIN user_ingredients ui ON ui.ingredient_id = i.id
+        LEFT JOIN effects_types et ON e.id = et.effect_id
+        WHERE ui.user_id = ?
+          AND (e.description LIKE ? OR et."type" LIKE ?)
+        ORDER BY e.description, i.name
+        LIMIT ?
+        """,
+        (user_id, f"%{query}%", f"%{query}%", limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
