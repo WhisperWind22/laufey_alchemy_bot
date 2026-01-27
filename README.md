@@ -27,6 +27,25 @@ This repository contains a working prototype with basic command handlers and hel
 - `reset_db.py` – recreate and populate the SQLite database using `young_alchemy.csv` and `all_effects_df.pkl`
 - `young_alchemy.csv` / `all_effects_df.pkl` – sample data files used for testing
 
+## Effect Resolution Algorithm (Разрешение эффектов)
+
+The effect resolution logic lives in:
+
+- `alchemy_tools/main.py` → `calculate_potion_effect(ingredient_ids, selected_effects)`
+- `alchemy_tools/effects_tools.py` → `get_all_properties_by_ingredient_id(ingredient_id)` (fetches main + additional effects with types/values)
+
+How it works, step by step:
+
+1. For each ingredient ID (duplicates ignored), the main effect is loaded (`ingredient_order = 0`).
+2. If the main effect has a typed effect (`effect_type`), its `effect_value` is summed into a running total per type.  
+   Otherwise, the effect description is treated as “uncompensated”.
+3. For additional effects, only the user-selected index from `selected_effects[ingredient_id]` is used.  
+   The same rules apply: typed effects are summed, untyped become uncompensated.
+4. Output includes:
+   - **Компенсированные эффекты**: summed totals by `effect_type`.
+   - **Некомпенсированные эффекты**: list of effect descriptions without a type.
+5. If `len(uncompensated) + len(effect_types) >= 5`, the bot appends the explosion warning.
+
 ## Running Tests
 
 Tests expect Python 3.12 and the dependencies listed in `pyproject.toml`. Run:
@@ -39,4 +58,3 @@ pytest
 ## Usage
 
 Create the SQLite database using `alchemy_tools/db_setup.py` and then run `alchemy_tools/main.py` with your Telegram API token in the `API_TOKEN` environment variable.
-
