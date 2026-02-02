@@ -1,10 +1,10 @@
 import os
+from collections import Counter
 from alchemy_tools.find_ingredients import (
     potential_candidates_with_max_score_several_steps,
 )
 import sqlite3
 import logging
-from collections import defaultdict
 
 from telegram import (
     Update,
@@ -25,14 +25,18 @@ from telegram.ext import (
 from alchemy_tools.db_fill import user_testing_add_all_ingredients
 from alchemy_tools.effects_tools import (
     get_all_properties_by_ingredient_id,
+    get_ingredient_code_by_id,
     get_ingredient_name_by_id,
     get_properties_by_ingredient_id,
     get_by_ingredients_with_codes,
     get_ingredient_id,
     search_effects_by_description,
+    find_tokens_by_effect_query,
 )
+from alchemy_tools.effects_resolution import resolve_potion_effects
 from alchemy_tools.user_ingredients import select_all_ingredients_by_user
 from alchemy_tools.user_settings import get_max_ingredients, set_max_ingredients
+from effect_suppression_v4 import MAX_EFFECTS, parse_selection_token, validate_recipe_tokens
 
 DB_PATH = "alchemy.db"
 
@@ -46,6 +50,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+FORMULA_SIZE = 5
+MAX_DUPLICATES_PER_INGREDIENT = 2
+
+
+def _selection_stats(selections):
+    counts = Counter()
+    used_indices = {}
+    for ingredient_id, add_index in selections:
+        counts[ingredient_id] += 1
+        used_indices.setdefault(ingredient_id, set()).add(add_index)
+    return counts, used_indices
+
+
+def _tokens_from_selections(selections):
+    tokens = []
+    for ingredient_id, add_index in selections:
+        code = get_ingredient_code_by_id(ingredient_id)
+        if not code:
+            continue
+        tokens.append(f"{code}{add_index + 1}")
+    return tokens
+
+
+def _selections_from_tokens(tokens):
+    selections = []
+    for token in tokens:
+        code, idx = parse_selection_token(token)
+        ingredient_id = get_ingredient_id(code)
+        selections.append((ingredient_id, idx - 1))
+    return selections
+
+
+def _validate_partial_tokens(tokens):
+    seen = set()
+    counts = Counter()
+    add_indices = {}
+    for token in tokens:
+        code, idx = parse_selection_token(token)
+        if token in seen:
+            raise ValueError("Нельзя использовать одинаковый токен дважды.")
+        seen.add(token)
+        counts[code] += 1
+        if counts[code] > MAX_DUPLICATES_PER_INGREDIENT:
+            raise ValueError("Нельзя использовать ингредиент более двух раз.")
+        add_indices.setdefault(code, set()).add(idx)
+        if len(add_indices[code]) != counts[code]:
+            raise ValueError("Повтор ингредиента возможен только с разными доп. эффектами.")
 
 def _shorten_text(text: str, limit: int = 500) -> str:
     if not text:
@@ -78,6 +129,17 @@ def _summarize_update(update: Update) -> str:
         f"type={kind} user_id={user_id} chat_id={chat_id} "
         f"message_id={message_id} text='{_shorten_text(content)}'"
     )
+
+
+def _format_effect_kind(effect_type, value):
+    if effect_type is None:
+        return ""
+    tier_labels = {1: "слабый", 2: "средний", 3: "сильный", 4: "смертельный"}
+    if effect_type == "poison" and value is not None:
+        return f" (яд: {tier_labels.get(value, value)})"
+    if effect_type == "antidote" and value is not None:
+        return f" (противоядие: {tier_labels.get(value, value)})"
+    return f" ({effect_type})"
 
 
 def ensure_db_tables() -> None:
@@ -188,95 +250,9 @@ def populate_test_data_for_user(user_id: int) -> None:
 
 
 
-def calculate_potion_effect(ingredient_ids, selected_effects):
-    """Вычисляем итоговые эффекты зелья с учётом компенсаций."""
-    all_effects_result = ""
-    not_compensated_effects = []
-    effects = defaultdict(lambda :0)
-    used_ingredients = set()
-
-    for ingredient_id in ingredient_ids:
-        if ingredient_id in used_ingredients:
-            continue
-        main_property, _ = get_all_properties_by_ingredient_id(ingredient_id)
-        if main_property:
-            ing_code,effect_description, effect_type, effect_value = main_property
-            all_effects_result += f"{ing_code} Главный эффект: {effect_description}"
-            if effect_type is not None:
-                all_effects_result += f" ({effect_type}: {effect_value})"
-                effects[effect_type] += effect_value
-                used_ingredients.add(ingredient_id)
-            else:
-                not_compensated_effects.append(effect_description)
-            all_effects_result += "\n"
-
-    for ingredient_id in ingredient_ids:
-        if ingredient_id not in selected_effects:
-            continue
-        _, additional_properties = get_all_properties_by_ingredient_id(ingredient_id)
-        effect_index = selected_effects[ingredient_id]
-        ing_code,effect_description, effect_type, effect_value = additional_properties[effect_index]
-        all_effects_result += f"{ing_code} Дополнительный эффект: {effect_description}"
-        if effect_type is not None:
-            all_effects_result += f" ({effect_type}: {effect_value})"
-            effects[effect_type] += effect_value
-            used_ingredients.add(ingredient_id)
-        else:
-            not_compensated_effects.append(effect_description)
-        all_effects_result += "\n"
-        
-    if effects:
-        all_effects_result += "\nКомпенсированные эффекты:\n"
-        for effect_type, value in effects.items():
-            all_effects_result += f"{effect_type}: {value}\n"
-    if not_compensated_effects:
-        all_effects_result += "\nНекомпенсированные эффекты:\n"
-        for effect in not_compensated_effects:
-            all_effects_result += f"- {effect}\n"
-    
-    if len(not_compensated_effects) + len(effects) >=5:
-        all_effects_result += "\n\nВнимание! Зелье имеет слишком много некомпенсированных эффектов. Будет взрыв."
-
-    return all_effects_result
-
-
-def find_optimal_ingredients(desired_effect, user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT DISTINCT i.id
-        FROM ingredients i
-        JOIN properties p ON i.id = p.ingredient_id
-        WHERE i.user_id = ? AND p.type = ? AND p.is_main = TRUE AND p.is_positive = TRUE
-    """, (user_id, desired_effect,))
-    base_ingredients = cursor.fetchall()  # [(id,), (id,), ...]
-
-    cursor.execute("SELECT id FROM ingredients WHERE user_id = ?", (user_id,))
-    all_ids = [row[0] for row in cursor.fetchall()]
-
-    best_combination = None
-    min_side_effects = float('inf')
-
-    for base in base_ingredients:
-        base_id = base[0]
-        others = [x for x in all_ids if x != base_id]
-        for i in range(len(others)):
-            for j in range(i + 1, len(others)):
-                ingredient_ids = [base_id, others[i], others[j]]
-                effects = calculate_potion_effect(ingredient_ids, {})
-
-                if effects.get(desired_effect, 0) <= 0:
-                    continue
-
-                side_effects = sum(1 for e_type, val in effects.items()
-                                   if e_type != desired_effect and val != 0)
-                if side_effects < min_side_effects:
-                    min_side_effects = side_effects
-                    best_combination = (ingredient_ids, effects)
-
-    conn.close()
-    return best_combination
+def calculate_potion_effect(selections):
+    """OBSOLETE: use resolve_potion_effects instead."""
+    return resolve_potion_effects(selections)["text"]
 
 
 
@@ -309,22 +285,36 @@ def main_menu_keyboard():
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ UI #
 ##############################
 
-async def show_selected_ingredients(user_id: int, selected_ids: list[int]) -> str:
-    if not selected_ids:
+async def show_selected_ingredients(user_id: int, selections: list[tuple[int, int]]) -> str:
+    if not selections:
         return "Выберите ингредиенты для вашего зелья:"
-    selected_ingredients = [get_ingredient_name_by_id(iid) for iid in selected_ids]
-    return "Выбранные ингредиенты:\n- " + "\n- ".join(selected_ingredients) + "\n\nВыберите ещё или закончите подбор."
+    lines = []
+    for ingredient_id, add_index in selections:
+        name = get_ingredient_name_by_id(ingredient_id)
+        code = get_ingredient_code_by_id(ingredient_id) or "?"
+        token = f"{code}{add_index + 1}"
+        lines.append(f"{token}: {name}")
+    return "Выбранные ингредиенты:\n- " + "\n- ".join(lines) + "\n\nВыберите ещё или закончите подбор."
 
 async def create_ingredients_keyboard(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     # Ensure users always have access to all ingredients.
     user_testing_add_all_ingredients(user_id)
     ingredients = select_all_ingredients_by_user(user_id)
     keyboard = []
-    selected_ingredients = context.user_data.get("ingredient_ids", [])
+    selections = context.user_data.get("selected_tokens", [])
+    counts, used_indices = _selection_stats(selections)
+
+    if len(selections) >= FORMULA_SIZE:
+        keyboard.append([
+            InlineKeyboardButton("Сбросить всё", callback_data="reset"),
+            InlineKeyboardButton("Закончить подбор", callback_data="done")
+        ])
+        return InlineKeyboardMarkup(keyboard)
 
     for ingredient_id, code, ingredient_type, material_analog, name in ingredients:
-        if ingredient_id not in selected_ingredients:
-            keyboard.append([InlineKeyboardButton(name, callback_data=f"add_{ingredient_id}")])
+        if counts.get(ingredient_id, 0) >= MAX_DUPLICATES_PER_INGREDIENT:
+            continue
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"add_{ingredient_id}")])
 
     keyboard.append([
         InlineKeyboardButton("Сбросить всё", callback_data="reset"),
@@ -332,16 +322,17 @@ async def create_ingredients_keyboard(user_id: int, context: ContextTypes.DEFAUL
     ])
     return InlineKeyboardMarkup(keyboard)
 
-async def create_effects_keyboard(ingredient_id: int):
+async def create_effects_keyboard(ingredient_id: int, used_indices: set[int] | None = None):
     main_property, additional_properties = get_all_properties_by_ingredient_id(ingredient_id)
     keyboard = []
+    used_indices = used_indices or set()
 
     # Доп. свойства
     for idx, prop in enumerate(additional_properties):
+        if idx in used_indices:
+            continue
         _,desc, eff_type, effect_value = prop
-        text_btn = f"{desc} "
-        if eff_type is not None:
-            text_btn += f" ({eff_type}: {effect_value})"
+        text_btn = f"{desc}"
         keyboard.append([InlineKeyboardButton(text_btn, callback_data=f"chooseeff_{ingredient_id}_{idx}")])
 
     return InlineKeyboardMarkup(keyboard)
@@ -370,12 +361,8 @@ async def list_ingredients(update: Update, context: ContextTypes.DEFAULT_TYPE, m
         if props:
             text += "Эффекты:\n"
             for desc, eff_type, value, ing_order in props:
-                sign = f" {value} "
                 main_str = "Основной: " if ing_order==0 else f"{ing_order} "
-                text += f"{main_str}{desc}"
-                if eff_type is not None:
-                    text+= f" ({eff_type}: {sign})"
-                text += "\n"
+                text += f"{main_str}{desc}\n"
         text += "\n"
 
     await message.reply_text(text[:4000], reply_markup=main_menu_keyboard())
@@ -469,12 +456,7 @@ async def search_effects(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
 
     text = f"Эффекты по запросу '{query}':\n"
     for (desc, eff_type, value), data in effects.items():
-        if eff_type is not None and value is not None:
-            type_part = f" ({eff_type}: {value:+d})"
-        elif eff_type is not None:
-            type_part = f" ({eff_type})"
-        else:
-            type_part = ""
+        type_part = _format_effect_kind(eff_type, value)
         ingredients = ", ".join([f"{name} ({code}, {role})" for name, code, role in data["ingredients"]])
         more = data["total"] - len(data["ingredients"])
         if more > 0:
@@ -489,7 +471,7 @@ async def search_effects(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_user_id(update)
     user_testing_add_all_ingredients(user_id)
-    context.user_data["ingredient_ids"] = []
+    context.user_data["selected_tokens"] = []
     await update.message.reply_text(
         "Добро пожаловать в алхимический помощник!\n"
         "Вы можете использовать кнопки меню или команды.\n"
@@ -553,8 +535,7 @@ async def craft(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None
         message = update.message
     user_id = get_user_id(update)
     user_testing_add_all_ingredients(user_id)
-    context.user_data["ingredient_ids"] = []
-    context.user_data["selected_effects"] = {}
+    context.user_data["selected_tokens"] = []
 
     reply_markup = await create_ingredients_keyboard(user_id, context)
     message_text = await show_selected_ingredients(user_id, [])
@@ -568,8 +549,7 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = get_user_id(update)
 
     if data == "reset":
-        context.user_data["ingredient_ids"] = []
-        context.user_data["selected_effects"] = {}
+        context.user_data["selected_tokens"] = []
         reply_markup = await create_ingredients_keyboard(user_id, context)
         message_text = await show_selected_ingredients(user_id, [])
         await query.edit_message_text(text=message_text, reply_markup=reply_markup)
@@ -577,10 +557,17 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data.startswith("add_"):
         ingredient_id = int(data.replace("add_", ""))
-        if ingredient_id in context.user_data.get("ingredient_ids", []):
-            await query.message.reply_text("Этот ингредиент уже добавлен!", reply_markup=main_menu_keyboard())
+        selections = context.user_data.get("selected_tokens", [])
+        counts, used_indices = _selection_stats(selections)
+        if counts.get(ingredient_id, 0) >= MAX_DUPLICATES_PER_INGREDIENT:
+            await query.message.reply_text("Этот ингредиент уже использован дважды.", reply_markup=main_menu_keyboard())
             return
-        reply_markup = await create_effects_keyboard(ingredient_id)
+        _, additional_properties = get_all_properties_by_ingredient_id(ingredient_id)
+        available = [idx for idx in range(len(additional_properties)) if idx not in used_indices.get(ingredient_id, set())]
+        if not available:
+            await query.message.reply_text("Для этого ингредиента нет доступных доп. эффектов.", reply_markup=main_menu_keyboard())
+            return
+        reply_markup = await create_effects_keyboard(ingredient_id, used_indices=used_indices.get(ingredient_id, set()))
         await query.edit_message_text(
             text="Выберите дополнительный эффект для ингредиента:",
             reply_markup=reply_markup
@@ -589,15 +576,22 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if data == "done":
-        ingredient_ids = context.user_data.get("ingredient_ids", [])
-        if len(ingredient_ids) < 3:
-            await query.message.reply_text("В зелье должно быть минимум 3 ингредиента!", reply_markup=main_menu_keyboard())
+        selections = context.user_data.get("selected_tokens", [])
+        if len(selections) < FORMULA_SIZE:
+            await query.message.reply_text(
+                f"В формуле должно быть {FORMULA_SIZE} ингредиентов!",
+                reply_markup=main_menu_keyboard(),
+            )
             return
-        if len(set(ingredient_ids)) != len(ingredient_ids):
-            await query.message.reply_text("В зелье не должно быть повторяющихся ингредиентов!", reply_markup=main_menu_keyboard())
+        tokens = _tokens_from_selections(selections)
+        try:
+            validate_recipe_tokens(tokens)
+        except ValueError as exc:
+            await query.message.reply_text(str(exc), reply_markup=main_menu_keyboard())
             return
 
-        effects_result_text = calculate_potion_effect(ingredient_ids, context.user_data.get("selected_effects", {}))
+        resolution = resolve_potion_effects(selections)
+        effects_result_text = resolution["text"]
         await query.edit_message_text(
             f"Рассчитанные эффекты:\n{effects_result_text}",
             reply_markup=main_menu_keyboard()
@@ -607,16 +601,24 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
         parts = data.split("_")
         ingredient_id = int(parts[1])
         eff_choice = parts[2]
+        selections = context.user_data.get("selected_tokens", [])
+        counts, used_indices = _selection_stats(selections)
+        if counts.get(ingredient_id, 0) >= MAX_DUPLICATES_PER_INGREDIENT:
+            await query.message.reply_text("Этот ингредиент уже использован дважды.", reply_markup=main_menu_keyboard())
+            return
+        add_index = int(eff_choice)
+        if add_index in used_indices.get(ingredient_id, set()):
+            await query.message.reply_text("Этот доп. эффект уже выбран для данного ингредиента.", reply_markup=main_menu_keyboard())
+            return
+        if len(selections) >= FORMULA_SIZE:
+            await query.message.reply_text("Формула уже заполнена.", reply_markup=main_menu_keyboard())
+            return
 
-        ingredient_ids = context.user_data.get("ingredient_ids", [])
-        ingredient_ids.append(ingredient_id)
-        context.user_data["ingredient_ids"] = ingredient_ids
-
-        if eff_choice != "no":
-            context.user_data["selected_effects"][ingredient_id] = int(eff_choice)
+        selections.append((ingredient_id, add_index))
+        context.user_data["selected_tokens"] = selections
 
         reply_markup = await create_ingredients_keyboard(user_id, context)
-        message_text = await show_selected_ingredients(user_id, ingredient_ids)
+        message_text = await show_selected_ingredients(user_id, selections)
         await query.edit_message_text(text=message_text, reply_markup=reply_markup)
         # Добавляем сообщение с обновленной клавиатурой
         await query.message.reply_text("Ингредиент добавлен.", reply_markup=main_menu_keyboard())
@@ -664,31 +666,72 @@ async def craft_optimal_with_effect(update: Update, context: ContextTypes.DEFAUL
 
     if len(context.args) == 0:
         await message.reply_text(
-            "Укажите желаемый эффект, например: /craft_optimal_with_effect сила",
+            "Укажите желаемый эффект, например: /craft_optimal_with_effect яд",
             reply_markup=main_menu_keyboard()
         )
         return
 
-    desired_effect = context.args[0].lower()
-    result = find_optimal_ingredients(desired_effect, user_id)
-    if result is None:
+    desired_effect = " ".join(context.args).strip().lower()
+    tokens = find_tokens_by_effect_query(desired_effect, user_id=user_id)
+    if not tokens:
         await message.reply_text(
-            f"Не удалось найти комбинацию для эффекта '{desired_effect}'",
+            f"Не удалось найти ингредиенты с эффектом '{desired_effect}'",
             reply_markup=main_menu_keyboard()
         )
         return
 
-    ingredient_ids, effects = result
-    ingredients_text = "\n".join([f"- {get_ingredient_name_by_id(iid)}" for iid in ingredient_ids])
-    effects_text = "\n".join([
-        f"{effect}: {'+' if value > 0 else ''}{value}" for effect, value in effects.items()
-    ])
+    best = None
+    best_score = -10_000
+    best_resolution = None
+    best_formula = None
 
+    for seed in tokens[:10]:
+        try:
+            _validate_partial_tokens([seed])
+        except ValueError:
+            continue
+        steps = FORMULA_SIZE - 1 - 1
+        if steps < 0:
+            steps = 0
+        formulas = potential_candidates_with_max_score_several_steps(
+            formula=[seed],
+            steps=steps,
+            only_max_score=True,
+            user_id=user_id,
+        )
+        if not formulas:
+            formulas = [[seed]]
+        for formula in formulas:
+            if len(formula) != FORMULA_SIZE:
+                continue
+            try:
+                validate_recipe_tokens(formula)
+            except ValueError:
+                continue
+            selections = _selections_from_tokens(formula)
+            resolution = resolve_potion_effects(selections)
+            if not any(desired_effect in eff.lower() for eff in resolution["active_effects"]):
+                continue
+            score = (MAX_EFFECTS - resolution["effect_count"]) if resolution["valid"] else -1000
+            if score > best_score:
+                best_score = score
+                best = selections
+                best_formula = formula
+                best_resolution = resolution
+
+    if not best or not best_resolution or not best_formula:
+        await message.reply_text(
+            f"Не удалось подобрать формулу с эффектом '{desired_effect}'. Попробуйте точнее указать эффект.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    effects_text = best_resolution["text"]
     await message.reply_text(
         f"Оптимальная комбинация для эффекта '{desired_effect}':\n\n"
-        f"Ингредиенты:\n{ingredients_text}\n\n"
+        f"Формула: {','.join(best_formula)}\n\n"
         f"Эффекты:\n{effects_text}",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(),
     )
 
 async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
@@ -716,7 +759,7 @@ async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAU
             return
     
     formula = formula_text.split(',')
-    max_ingredients = get_max_ingredients(user_id, default=3)
+    max_ingredients = FORMULA_SIZE
     if len(formula) >= max_ingredients:
         await message.reply_text(
             f"Формула уже содержит {len(formula)} ингредиентов. "
@@ -736,6 +779,7 @@ async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAU
         )
 
     try:
+        _validate_partial_tokens(formula)
         result_formulas = potential_candidates_with_max_score_several_steps(
             formula=formula, 
             steps=steps, 
@@ -761,18 +805,12 @@ async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAU
         result_text = "Оптимальные варианты формулы:\n\n"
         
         for i, result_formula in enumerate(result_formulas[:5]):  # Ограничиваем вывод 5 результатами
-            ingredient_ids = []
-            selected_effects = {}
-
-            # all_formula_effects_df = get_by_ingredients_with_codes(ingredients_with_codes=result_formula)
-
-            for ingredient_code_order in result_formula:
-                ingredient_code=ingredient_code_order[:-1]
-                ingredient_order=int(ingredient_code_order[-1])
-                ingredient_id=get_ingredient_id(ingredient_code=ingredient_code)
-                ingredient_ids.append(ingredient_id)
-                selected_effects[ingredient_id]=ingredient_order-1
-            effects_result = calculate_potion_effect(ingredient_ids, selected_effects)
+            try:
+                validate_recipe_tokens(result_formula)
+            except ValueError:
+                continue
+            selections = _selections_from_tokens(result_formula)
+            effects_result = resolve_potion_effects(selections)["text"]
             
             result_text += f"Вариант {i+1}:\n"
             result_text += f"Формула: {','.join(result_formula)}\n"

@@ -14,7 +14,7 @@ def _ensure_table(cursor) -> None:
     )
 
 
-def get_max_ingredients(user_id: int, default: int = 3) -> int:
+def get_max_ingredients(user_id: int, default: int = 5) -> int:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     _ensure_table(cursor)

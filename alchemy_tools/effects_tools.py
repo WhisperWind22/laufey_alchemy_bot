@@ -67,6 +67,15 @@ def get_ingredient_name_by_id(ingredient_id):
     conn.close()
     return result[0] if result else "Неизвестный ингредиент"
 
+
+def get_ingredient_code_by_id(ingredient_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT code FROM ingredients WHERE id = ?", (ingredient_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
 def get_all_properties_by_ingredient_id(ingredient_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -123,7 +132,7 @@ def search_effects_by_description(query: str, user_id: int, limit: int = 1000):
         JOIN user_ingredients ui ON ui.ingredient_id = i.id
         LEFT JOIN effects_types et ON e.id = et.effect_id
         WHERE ui.user_id = ?
-          AND (e.description LIKE ? OR et."type" LIKE ?)
+          AND (LOWER(e.description) LIKE ? OR LOWER(et."type") LIKE ?)
         ORDER BY e.description, i.name
         LIMIT ?
         """,
@@ -132,3 +141,40 @@ def search_effects_by_description(query: str, user_id: int, limit: int = 1000):
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+def find_tokens_by_effect_query(query: str, user_id: int | None = None):
+    """Return selection tokens (e.g. 'RK1') for effects matching query."""
+    query = query.strip().lower()
+    if not query:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    base_sql = """
+        SELECT i.code, p.ingredient_order, e.description
+        FROM effects e
+        JOIN properties p ON e.id = p.effect_id
+        JOIN ingredients i ON i.id = p.ingredient_id
+    """
+    if user_id is None:
+        sql = base_sql + " WHERE LOWER(e.description) LIKE ?"
+        params = (f"%{query}%",)
+    else:
+        sql = base_sql + """
+            JOIN user_ingredients ui ON ui.ingredient_id = i.id
+            WHERE ui.user_id = ? AND LOWER(e.description) LIKE ?
+        """
+        params = (user_id, f"%{query}%",)
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    tokens = set()
+    for code, ingredient_order, _desc in rows:
+        if ingredient_order == 0:
+            tokens.update({f"{code}1", f"{code}2", f"{code}3"})
+        else:
+            tokens.add(f"{code}{ingredient_order}")
+    return sorted(tokens)

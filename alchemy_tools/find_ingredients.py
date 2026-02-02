@@ -1,4 +1,5 @@
 import pandas as pd
+from collections import Counter
 from .db_wrapper import db_alchemy_wrapper
 from .effects_tools import SELECT_ALL_EFFECTS
 from .evaluate_ingredients import calculate_score_by_formula
@@ -27,48 +28,41 @@ where
 ## where et."type" is not Null
 
 
-def potential_candidates_codes_generator_by_effect_type(potential_candidates,effect_type,positive_effects=True):
-    potential_candidates=potential_candidates[potential_candidates["effect_type"]==effect_type]
-    if positive_effects:
-        potential_candidates=potential_candidates[potential_candidates["effect_value"]>=0]
-    else:
-        potential_candidates=potential_candidates[potential_candidates["effect_value"]<0]
-    potential_candidates_codes =potential_candidates["code"].unique()
-    potential_candidates_codes=[]
-    for _,row in potential_candidates.iterrows():
-        if row["ingredient_order"]==0:
-            potential_candidates_codes.append(row["code"]+"1")
-            potential_candidates_codes.append(row["code"]+"2")
-            potential_candidates_codes.append(row["code"]+"3")
-        else:
-            potential_candidates_codes.append(row["code"]+str(row["ingredient_order"]))
-    return potential_candidates_codes
+def _all_tokens(all_ingredients_effects):
+    tokens = set()
+    for _, row in all_ingredients_effects.iterrows():
+        order = int(row["ingredient_order"])
+        if order == 0:
+            continue
+        tokens.add(f"{row['code']}{order}")
+    return sorted(tokens)
 
-def potential_candidates_codes_generator(all_ingredients_effects,formula,positive_effects=True):
-    ingredients, ingredients_effects_nums = split_formula(formula)
-    current_ingredients_types= []
-    for ingredient, ingredient_effect_num in zip(ingredients, ingredients_effects_nums):
-        _cur_ingredient_effects = all_ingredients_effects[all_ingredients_effects["code"]==ingredient]
-        main_effect_type = _cur_ingredient_effects[_cur_ingredient_effects["ingredient_order"]==0]["effect_type"].values[0]
-        if main_effect_type is not None:
-            current_ingredients_types.append(main_effect_type)
-        minor_effect_type = _cur_ingredient_effects[_cur_ingredient_effects["ingredient_order"]==ingredient_effect_num]["effect_type"].values[0]
-        if minor_effect_type is not None:
-            current_ingredients_types.append(minor_effect_type)
-    current_effects_types = list(set(current_ingredients_types))
 
-    potential_candidates=all_ingredients_effects[~all_ingredients_effects["code"].isin(ingredients)]
-    all_candidates = []
-    for effect_type in current_effects_types:
-        all_candidates.extend(potential_candidates_codes_generator_by_effect_type(potential_candidates,effect_type,positive_effects=positive_effects))
-    return all_candidates
+def _is_candidate_allowed(formula, candidate):
+    if candidate in formula:
+        return False
+    codes, orders = split_formula(formula)
+    cand_code, cand_order = candidate[:-1], int(candidate[-1])
+    counts = Counter(codes)
+    if counts.get(cand_code, 0) >= 2:
+        return False
+    for code, order in zip(codes, orders):
+        if code == cand_code and order == cand_order:
+            return False
+    if cand_order < 1 or cand_order > 3:
+        return False
+    return True
+
+def potential_candidates_codes_generator(all_ingredients_effects, formula, positive_effects=True):
+    all_tokens = _all_tokens(all_ingredients_effects)
+    return [tok for tok in all_tokens if _is_candidate_allowed(formula, tok)]
 
 
 @db_alchemy_wrapper
 def potential_candidates_with_max_score_one_step(all_ingredients_effects,formula,cursor,only_max_score=True):
     potential_candidates_codes = potential_candidates_codes_generator(all_ingredients_effects,formula)
     if len(potential_candidates_codes)==0:
-        potential_candidates_codes=(all_ingredients_effects["code"]+all_ingredients_effects["ingredient_order"].astype(str)).to_list()
+        potential_candidates_codes=_all_tokens(all_ingredients_effects)
     potential_candidates_scores=[]
     for potential_candidate_code in potential_candidates_codes:
         potential_candidates_scores.append(calculate_score_by_formula(formula+[potential_candidate_code],cursor=cursor))
@@ -108,5 +102,15 @@ def potential_candidates_with_max_score_several_steps(formula,cursor,steps=1,onl
 
 def validate_formula(formula):
     codes,orders = split_formula(formula)
-    if max(orders)>3 or min(orders)<0:
+    if max(orders)>3 or min(orders)<1:
         raise ValueError()
+    counts = Counter(codes)
+    for code, count in counts.items():
+        if count > 2:
+            raise ValueError()
+    seen = set()
+    for code, order in zip(codes, orders):
+        token = f"{code}{order}"
+        if token in seen:
+            raise ValueError()
+        seen.add(token)

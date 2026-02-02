@@ -5,18 +5,26 @@ from alchemy_tools.evaluate_ingredients import evaluate_effects
 def test_evaluate_effects_basic():
     df = pd.DataFrame({
         "code": ["A", "B", "C", "D", "E"],
-        "description": ["d1", "d2", "d3", "d4", "d5"],
-        "effect_type": ["good", "bad", None, "good", None],
-        "effect_value": [1, -1, 1, 2, -2],
+        "description": [
+            "Слабый яд",
+            "Слабое Противоядие",
+            "Снотворное средство",
+            "Бодрость (способность находиться в состоянии высокого жизненного тонуса, избытка сил и желания что-либо делать)",
+            "Галлюцинации",
+        ],
     })
-    assert evaluate_effects(df) == -90
+    assert evaluate_effects(df) == 3
 
 
-def test_evaluate_effects_other_penalty():
+def test_evaluate_effects_invalid():
     df = pd.DataFrame({
-        "code": list("ABCDEF"),
-        "description": ["d" + x for x in "ABCDEF"],
-        "effect_type": [None, None, None, None, None, "good"],
-        "effect_value": [1, 1, 1, 1, 1, 2],
+        "code": list("ABCDE"),
+        "description": [
+            "Бесстрашие и безрассудство",
+            "Барьер Души снижается до 1 единицы",
+            "Блокирует магическую силу (сила эликсира = время в минутах)",
+            "Вводит в состояние депрессии",
+            "В составе эликсира дает магу защиту от различных духов и призраков, защищая от проникновения их в тело.",
+        ],
     })
-    assert evaluate_effects(df) == -990
+    assert evaluate_effects(df) == -1000
