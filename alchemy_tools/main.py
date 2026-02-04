@@ -1,5 +1,6 @@
 import os
 from collections import Counter
+from pathlib import Path
 from alchemy_tools.find_ingredients import (
     potential_candidates_with_max_score_several_steps,
 )
@@ -140,6 +141,21 @@ def _format_effect_kind(effect_type, value):
     if effect_type == "antidote" and value is not None:
         return f" (противоядие: {tier_labels.get(value, value)})"
     return f" ({effect_type})"
+
+
+def _load_env_file() -> None:
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def ensure_db_tables() -> None:
@@ -837,7 +853,10 @@ async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAU
 #############################
 
 def main():
-    token = os.getenv("API_TOKEN")  # настройте переменные окружения
+    _load_env_file()
+    token = os.getenv("API_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("API_TOKEN или TELEGRAM_TOKEN не задан в окружении/.env")
     application = ApplicationBuilder().token(token).build()
 
     # Команды
