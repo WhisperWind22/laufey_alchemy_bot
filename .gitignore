@@ -829,6 +829,11 @@ celerybeat.pid
 
 # Environments
 .env
+
+# Local runtime artifacts
+alchemy.db
+alchemy.db-*
+.idea/
 .venv
 env/
 venv/

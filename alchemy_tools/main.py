@@ -1,12 +1,14 @@
 import os
 from collections import Counter
 from pathlib import Path
+import asyncio
 from alchemy_tools.find_ingredients import (
     potential_candidates_with_max_score_several_steps,
 )
 import sqlite3
 import logging
 
+from telegram.error import Conflict, BadRequest, TimedOut, NetworkError
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -35,9 +37,13 @@ from alchemy_tools.effects_tools import (
     find_tokens_by_effect_query,
 )
 from alchemy_tools.effects_resolution import resolve_potion_effects
+from alchemy_tools.v5_data import get_add_effects_for_code, get_main_effect_for_code
+from alchemy_tools.v5_data import load_v5_data
 from alchemy_tools.user_ingredients import select_all_ingredients_by_user
 from alchemy_tools.user_settings import get_max_ingredients, set_max_ingredients
-from effect_suppression_v4 import MAX_EFFECTS, parse_selection_token, validate_recipe_tokens
+from effect_suppression import MAX_EFFECTS, parse_selection_token, validate_recipe_tokens
+from alchemy_tools.v5_recipe_search import find_best_recipes_for_effect
+from alchemy_tools.v5_data import search_effect_texts
 
 DB_PATH = "alchemy.db"
 
@@ -46,13 +52,38 @@ DB_PATH = "alchemy.db"
 ############################
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO if os.getenv("DEBUG") not in ("1", "true", "True") else logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 FORMULA_SIZE = 5
 MAX_DUPLICATES_PER_INGREDIENT = 2
+
+
+async def _safe_answer_callback_query(query) -> None:
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        # Common after restarts: Telegram may deliver stale callback queries.
+        if "Query is too old" in str(exc) or "query id is invalid" in str(exc):
+            return
+        raise
+
+
+async def _safe_edit_message_text(query, text: str, reply_markup=None) -> None:
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup)
+    except BadRequest:
+        # Message can be too old / already edited / unavailable. Fall back to a new message.
+        if getattr(query, "message", None):
+            await query.message.reply_text(text, reply_markup=reply_markup)
+        else:
+            raise
 
 
 def _selection_stats(selections):
@@ -130,6 +161,36 @@ def _summarize_update(update: Update) -> str:
         f"type={kind} user_id={user_id} chat_id={chat_id} "
         f"message_id={message_id} text='{_shorten_text(content)}'"
     )
+
+def _format_recipe_breakdown(tokens: list[str]) -> str:
+    """
+    Human-friendly recipe breakdown:
+    - ingredient name
+    - main effect
+    - chosen additional effect (by token index 1..3)
+    """
+    v5 = load_v5_data()
+    lines: list[str] = ["Ингредиенты (основной + выбранный доп. эффект):"]
+    for tok in tokens:
+        try:
+            code, idx = parse_selection_token(tok)  # idx is 1..3
+        except Exception:
+            lines.append(f"- {tok}: (не удалось распарсить токен)")
+            continue
+
+        ing = v5.ingredient_db.get(code, {})
+        name = (ing.get("name") or code).strip()
+        main = (get_main_effect_for_code(code) or "").strip()
+        adds = get_add_effects_for_code(code)
+        chosen_add = (adds[idx - 1] if 1 <= idx <= len(adds) else "") if adds else ""
+        chosen_add = (chosen_add or "").strip()
+
+        lines.append(f"- {code}{idx}: {name}")
+        if main:
+            lines.append(f"  Основной: {main}")
+        if chosen_add:
+            lines.append(f"  Доп. #{idx}: {chosen_add}")
+    return "\n".join(lines).rstrip()
 
 
 def _format_effect_kind(effect_type, value):
@@ -339,16 +400,19 @@ async def create_ingredients_keyboard(user_id: int, context: ContextTypes.DEFAUL
     return InlineKeyboardMarkup(keyboard)
 
 async def create_effects_keyboard(ingredient_id: int, used_indices: set[int] | None = None):
-    main_property, additional_properties = get_all_properties_by_ingredient_id(ingredient_id)
+    code = get_ingredient_code_by_id(ingredient_id) or ""
+    add_effects = get_add_effects_for_code(code) if code else []
     keyboard = []
     used_indices = used_indices or set()
 
-    # Доп. свойства
-    for idx, prop in enumerate(additional_properties):
+    # Доп. эффекты (add1..add3)
+    for idx, desc in enumerate(add_effects[:3]):
         if idx in used_indices:
             continue
-        _,desc, eff_type, effect_value = prop
-        text_btn = f"{desc}"
+        desc = (desc or "").strip()
+        if not desc:
+            continue
+        text_btn = desc if len(desc) <= 80 else (desc[:77] + "...")
         keyboard.append([InlineKeyboardButton(text_btn, callback_data=f"chooseeff_{ingredient_id}_{idx}")])
 
     return InlineKeyboardMarkup(keyboard)
@@ -373,12 +437,14 @@ async def list_ingredients(update: Update, context: ContextTypes.DEFAULT_TYPE, m
     for ing_id, code, ingredient_type, material_analog, name in ingredients:
         text += f"{code}: {name}\n"
         text += f" Тип: {ingredient_type}| Материальный аналог {material_analog}\n"
-        props = get_properties_by_ingredient_id(ing_id)
-        if props:
+        main_eff = (get_main_effect_for_code(code) or "").strip()
+        adds = [a for a in get_add_effects_for_code(code) if (a or "").strip()]
+        if main_eff or adds:
             text += "Эффекты:\n"
-            for desc, eff_type, value, ing_order in props:
-                main_str = "Основной: " if ing_order==0 else f"{ing_order} "
-                text += f"{main_str}{desc}\n"
+            if main_eff:
+                text += f"Основной: {main_eff}\n"
+            for i, eff in enumerate(adds[:3], start=1):
+                text += f"{i}: {eff}\n"
         text += "\n"
 
     await message.reply_text(text[:4000], reply_markup=main_menu_keyboard())
@@ -405,22 +471,16 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE, m
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer_callback_query(query)
     user_id = get_user_id(update)
     data = query.data or ""
     if data == "setmax_3":
         set_max_ingredients(user_id, 3)
-        await query.edit_message_text(
-            "Лимит подбора установлен: до 3 ингредиентов.",
-            reply_markup=main_menu_keyboard(),
-        )
+        await _safe_edit_message_text(query, "Лимит подбора установлен: до 3 ингредиентов.")
         return
     if data == "setmax_5":
         set_max_ingredients(user_id, 5)
-        await query.edit_message_text(
-            "Лимит подбора установлен: до 5 ингредиентов.",
-            reply_markup=main_menu_keyboard(),
-        )
+        await _safe_edit_message_text(query, "Лимит подбора установлен: до 5 ингредиентов.")
         return
 
 
@@ -525,7 +585,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_help_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer_callback_query(query)
     message = query.message
     user_id = get_user_id(update)
 
@@ -560,7 +620,7 @@ async def craft(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None
 
 async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer_callback_query(query)
     data = query.data
     user_id = get_user_id(update)
 
@@ -568,7 +628,7 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["selected_tokens"] = []
         reply_markup = await create_ingredients_keyboard(user_id, context)
         message_text = await show_selected_ingredients(user_id, [])
-        await query.edit_message_text(text=message_text, reply_markup=reply_markup)
+        await _safe_edit_message_text(query, message_text, reply_markup=reply_markup)
         return
 
     if data.startswith("add_"):
@@ -578,16 +638,18 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
         if counts.get(ingredient_id, 0) >= MAX_DUPLICATES_PER_INGREDIENT:
             await query.message.reply_text("Этот ингредиент уже использован дважды.", reply_markup=main_menu_keyboard())
             return
-        _, additional_properties = get_all_properties_by_ingredient_id(ingredient_id)
-        available = [idx for idx in range(len(additional_properties)) if idx not in used_indices.get(ingredient_id, set())]
+        code = get_ingredient_code_by_id(ingredient_id) or ""
+        add_effects = get_add_effects_for_code(code) if code else []
+        available = [
+            idx
+            for idx, txt in enumerate(add_effects[:3])
+            if idx not in used_indices.get(ingredient_id, set()) and (txt or "").strip()
+        ]
         if not available:
             await query.message.reply_text("Для этого ингредиента нет доступных доп. эффектов.", reply_markup=main_menu_keyboard())
             return
         reply_markup = await create_effects_keyboard(ingredient_id, used_indices=used_indices.get(ingredient_id, set()))
-        await query.edit_message_text(
-            text="Выберите дополнительный эффект для ингредиента:",
-            reply_markup=reply_markup
-        )
+        await _safe_edit_message_text(query, "Выберите дополнительный эффект для ингредиента:", reply_markup=reply_markup)
         context.user_data["current_ingredient"] = ingredient_id
         return
 
@@ -608,10 +670,12 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
 
         resolution = resolve_potion_effects(selections)
         effects_result_text = resolution["text"]
-        await query.edit_message_text(
-            f"Рассчитанные эффекты:\n{effects_result_text}",
-            reply_markup=main_menu_keyboard()
-        )
+        tokens = _tokens_from_selections(selections)
+        recipe_text = _format_recipe_breakdown(tokens)
+        await _safe_edit_message_text(query, f"{recipe_text}\n\nРассчитанные эффекты:\n{effects_result_text}")
+        # ReplyKeyboardMarkup can't be attached to editMessageText (only InlineKeyboardMarkup is allowed).
+        # Send a small message to (re)show the persistent main menu.
+        await query.message.reply_text("Готово.", reply_markup=main_menu_keyboard())
 
     if data.startswith("chooseeff_"):
         parts = data.split("_")
@@ -635,7 +699,7 @@ async def ingredient_selection(update: Update, context: ContextTypes.DEFAULT_TYP
 
         reply_markup = await create_ingredients_keyboard(user_id, context)
         message_text = await show_selected_ingredients(user_id, selections)
-        await query.edit_message_text(text=message_text, reply_markup=reply_markup)
+        await _safe_edit_message_text(query, message_text, reply_markup=reply_markup)
         # Добавляем сообщение с обновленной клавиатурой
         await query.message.reply_text("Ингредиент добавлен.", reply_markup=main_menu_keyboard())
 
@@ -665,6 +729,18 @@ async def log_callback_updates(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # If another instance is polling with the same token, PTB will raise Conflict
+    # in the updater loop. Stop quickly with a clear log line instead of spamming
+    # stack traces.
+    if isinstance(getattr(context, "error", None), Conflict):
+        logger.error("Bot stopped: another instance is already polling (Telegram getUpdates conflict).")
+        os._exit(1)
+
+    # Network instability is common; treat it as non-fatal noise.
+    if isinstance(getattr(context, "error", None), (TimedOut, NetworkError)):
+        logger.warning("Telegram network error: %r", context.error)
+        return
+
     if isinstance(update, Update):
         logger.exception("unhandled error on update: %s", _summarize_update(update), exc_info=context.error)
     else:
@@ -687,68 +763,87 @@ async def craft_optimal_with_effect(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    desired_effect = " ".join(context.args).strip().lower()
-    tokens = find_tokens_by_effect_query(desired_effect, user_id=user_id)
-    if not tokens:
+    query = " ".join(context.args).strip()
+    candidates = search_effect_texts(query, limit=12)
+    if not candidates:
         await message.reply_text(
-            f"Не удалось найти ингредиенты с эффектом '{desired_effect}'",
-            reply_markup=main_menu_keyboard()
-        )
-        return
-
-    best = None
-    best_score = -10_000
-    best_resolution = None
-    best_formula = None
-
-    for seed in tokens[:10]:
-        try:
-            _validate_partial_tokens([seed])
-        except ValueError:
-            continue
-        steps = FORMULA_SIZE - 1 - 1
-        if steps < 0:
-            steps = 0
-        formulas = potential_candidates_with_max_score_several_steps(
-            formula=[seed],
-            steps=steps,
-            only_max_score=True,
-            user_id=user_id,
-        )
-        if not formulas:
-            formulas = [[seed]]
-        for formula in formulas:
-            if len(formula) != FORMULA_SIZE:
-                continue
-            try:
-                validate_recipe_tokens(formula)
-            except ValueError:
-                continue
-            selections = _selections_from_tokens(formula)
-            resolution = resolve_potion_effects(selections)
-            if not any(desired_effect in eff.lower() for eff in resolution["active_effects"]):
-                continue
-            score = (MAX_EFFECTS - resolution["effect_count"]) if resolution["valid"] else -1000
-            if score > best_score:
-                best_score = score
-                best = selections
-                best_formula = formula
-                best_resolution = resolution
-
-    if not best or not best_resolution or not best_formula:
-        await message.reply_text(
-            f"Не удалось подобрать формулу с эффектом '{desired_effect}'. Попробуйте точнее указать эффект.",
+            f"Не удалось найти эффект по запросу '{query}'.",
             reply_markup=main_menu_keyboard(),
         )
         return
 
-    effects_text = best_resolution["text"]
+    # If there is only one candidate, use it immediately.
+    if len(candidates) == 1:
+        effect_text = candidates[0]
+        await message.reply_text("Подбираю рецепт...", reply_markup=main_menu_keyboard())
+        results = await asyncio.to_thread(find_best_recipes_for_effect, effect_text)
+        if not results:
+            await message.reply_text(
+                f"Не удалось подобрать рецепт под эффект:\n{effect_text}",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        best = results[0]
+        logs = [f"{a}: {d}" for a, d in (best.logs or [])]
+        recipe_text = _format_recipe_breakdown(best.tokens)
+        await message.reply_text(
+            f"Цель: {effect_text}\n\n"
+            f"Формула: {','.join(best.tokens)}\n\n"
+            f"{recipe_text}\n\n"
+            f"Итоговые эффекты:\n- " + "\n- ".join(best.final_effects) + "\n\n"
+            f"Подавления/правила:\n- " + ("\n- ".join(logs) if logs else "Нет"),
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    context.user_data["target_effect_candidates"] = candidates
+    keyboard = []
+    for i, text in enumerate(candidates):
+        label = text if len(text) <= 60 else (text[:57] + "...")
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"choose_target_effect:{i}")])
     await message.reply_text(
-        f"Оптимальная комбинация для эффекта '{desired_effect}':\n\n"
-        f"Формула: {','.join(best_formula)}\n\n"
-        f"Эффекты:\n{effects_text}",
-        reply_markup=main_menu_keyboard(),
+        "Уточни, какой именно эффект нужен:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+async def choose_target_effect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    data = query.data or ""
+    try:
+        idx = int(data.split(":", 1)[1])
+    except Exception:
+        await _safe_edit_message_text(query, "Некорректный выбор эффекта.")
+        return
+
+    candidates = context.user_data.get("target_effect_candidates") or []
+    if idx < 0 or idx >= len(candidates):
+        await _safe_edit_message_text(query, "Эффект не найден (устаревший список). Повтори команду.")
+        return
+
+    effect_text = candidates[idx]
+    await _safe_edit_message_text(query, f"Цель выбрана:\n{effect_text}\n\nПодбираю рецепт...")
+
+    results = await asyncio.to_thread(find_best_recipes_for_effect, effect_text)
+    if not results:
+        await query.message.reply_text(
+            f"Не удалось подобрать рецепт под эффект:\n{effect_text}",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    best = results[0]
+    logs = [f"{a}: {d}" for a, d in (best.logs or [])]
+    recipe_text = _format_recipe_breakdown(best.tokens)
+    text = (
+        f"Цель: {effect_text}\n\n"
+        f"Формула: {','.join(best.tokens)}\n\n"
+        f"{recipe_text}\n\n"
+        f"Итоговые эффекты:\n- " + "\n- ".join(best.final_effects) + "\n\n"
+        f"Подавления/правила:\n- " + ("\n- ".join(logs) if logs else "Нет")
+    )
+    await query.message.reply_text(text[:4000], reply_markup=main_menu_keyboard())
 
 async def craft_optimal_from_formula(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None) -> None:
     if message is None:
@@ -857,7 +952,28 @@ def main():
     token = os.getenv("API_TOKEN") or os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("API_TOKEN или TELEGRAM_TOKEN не задан в окружении/.env")
-    application = ApplicationBuilder().token(token).build()
+    # PTB defaults are quite aggressive (5s connect/read/write). On flaky networks
+    # this produces frequent TimedOut exceptions on send_message/getUpdates.
+    builder = (
+        ApplicationBuilder()
+        .token(token)
+        .connect_timeout(20.0)
+        .read_timeout(20.0)
+        .write_timeout(20.0)
+        .pool_timeout(10.0)
+        .get_updates_connect_timeout(20.0)
+        # Long polling keeps the request open; read timeout must exceed that.
+        .get_updates_read_timeout(65.0)
+        .get_updates_write_timeout(20.0)
+        .get_updates_pool_timeout(10.0)
+    )
+
+    proxy_url = os.getenv("TELEGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    if proxy_url:
+        logger.info("Using Telegram proxy from env (TELEGRAM_PROXY/HTTPS_PROXY/HTTP_PROXY).")
+        builder = builder.proxy_url(proxy_url).get_updates_proxy_url(proxy_url)
+
+    application = builder.build()
 
     # Команды
     application.add_handler(MessageHandler(filters.ALL, log_all_updates, block=False), group=-1)
@@ -875,6 +991,7 @@ def main():
     # Callback
     application.add_handler(CallbackQueryHandler(handle_help_buttons, pattern="^help_"))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^setmax_"))
+    application.add_handler(CallbackQueryHandler(choose_target_effect_callback, pattern="^choose_target_effect:"))
     application.add_handler(CallbackQueryHandler(ingredient_selection, pattern="^(reset|add_|done|chooseeff_)"))
 
     # Текстовые сообщения
@@ -884,7 +1001,8 @@ def main():
     application.add_handler(MessageHandler(filters.COMMAND, handle_help_buttons))
 
     application.add_error_handler(error_handler)
-    application.run_polling()
+    # Avoid processing stale callback queries and messages after restart.
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

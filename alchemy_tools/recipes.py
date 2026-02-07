@@ -3,7 +3,7 @@ import sqlite3
 
 from alchemy_tools.effects_resolution import resolve_potion_effects
 from alchemy_tools.effects_tools import get_ingredient_id
-from effect_suppression_v4 import parse_selection_token
+from effect_suppression import parse_selection_token
 
 DB_PATH = "alchemy.db"
 

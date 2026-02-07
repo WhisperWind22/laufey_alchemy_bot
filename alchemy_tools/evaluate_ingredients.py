@@ -1,4 +1,4 @@
-from effect_suppression_v4 import MAX_EFFECTS, suppress_effect_texts
+from effect_suppression import MAX_EFFECTS, suppress_effect_texts
 from .db_wrapper import db_alchemy_wrapper
 from .effects_tools import get_by_ingredients_with_codes
 

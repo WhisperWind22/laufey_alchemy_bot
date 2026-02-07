@@ -210,3 +210,110 @@ def fill_ingredients_table_v4(
 
     conn.commit()
     conn.close()
+
+
+def fill_ingredients_table_v5(
+    ingredients_path: str | Path = "alchemy_bot_data_v5/ingredients_v5.json",
+    categories_path: str | Path = "alchemy_bot_data_v5/effect_categories_v5.csv",
+):
+    """
+    Fill DB from v5 pack (ingredients_v5.json + effect_categories_v5.csv).
+
+    Important: keep effect text casing as-is (after v5 normalize_text), because v5 resolver
+    is case-sensitive on category keys.
+    """
+    from alchemy_tools.v5_data import load_v5_data
+
+    v5 = load_v5_data()
+    ingredients_path = Path(ingredients_path)
+    categories_path = Path(categories_path)
+
+    # Use the v5 pack normalization + loader to stay consistent with resolver keys.
+    cats = v5.suppression_mod.load_effect_categories(str(categories_path))
+
+    with ingredients_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    ingredients = data["ingredients"]
+    if not isinstance(ingredients, dict):
+        raise ValueError("v5 ingredients JSON must contain a dict at key 'ingredients'")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    tier_rank = {"weak": 1, "medium": 2, "strong": 3, "deadly": 4}
+
+    def norm(text: str) -> str:
+        return v5.suppression_mod.normalize_text(text)
+
+    def get_or_create_effect(effect_text: str) -> int:
+        effect_text = norm(effect_text)
+        cursor.execute("SELECT id FROM effects WHERE description = ?", (effect_text,))
+        row = cursor.fetchone()
+        if row:
+            return int(row[0])
+        cursor.execute("INSERT INTO effects (description) VALUES (?)", (effect_text,))
+        return int(cursor.lastrowid)
+
+    for code, ing in ingredients.items():
+        code = (code or "").strip()
+        if not code:
+            continue
+
+        name = norm(ing.get("name") or "")
+        material = norm(ing.get("material") or "")
+        ingredient_type = norm(ing.get("ingredient_type") or "")
+
+        cursor.execute("SELECT id FROM ingredients WHERE code = ?", (code,))
+        row = cursor.fetchone()
+        if row:
+            ingredient_id = int(row[0])
+            cursor.execute(
+                "UPDATE ingredients SET name = ?, material_analog = ?, ingredient_type = ? WHERE id = ?",
+                (name, material, ingredient_type, ingredient_id),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO ingredients (code, material_analog, ingredient_type, name) VALUES (?, ?, ?, ?)",
+                (code, material, ingredient_type, name),
+            )
+            ingredient_id = int(cursor.lastrowid)
+
+        effects = [
+            (0, ing.get("main") or "", True),
+            (1, ing.get("add1") or "", False),
+            (2, ing.get("add2") or "", False),
+            (3, ing.get("add3") or "", False),
+        ]
+
+        for ingredient_order, effect_text, is_main in effects:
+            effect_text = norm(effect_text)
+            if not effect_text:
+                continue
+
+            effect_id = get_or_create_effect(effect_text)
+
+            cat = cats.get(effect_text) or {}
+            kind = (cat.get("kind") or "").strip()
+            tier = (cat.get("tier") or "").strip()
+            tier_value = tier_rank.get(tier) if tier else None
+
+            if kind and kind != "raw":
+                cursor.execute("SELECT 1 FROM effects_types WHERE effect_id = ?", (effect_id,))
+                if cursor.fetchone() is None:
+                    cursor.execute(
+                        "INSERT INTO effects_types (effect_id, type, value) VALUES (?, ?, ?)",
+                        (effect_id, kind, tier_value),
+                    )
+
+            cursor.execute(
+                "SELECT 1 FROM properties WHERE ingredient_id = ? AND effect_id = ? AND ingredient_order = ?",
+                (ingredient_id, effect_id, ingredient_order),
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "INSERT INTO properties (ingredient_id, effect_id, ingredient_order, is_main) VALUES (?, ?, ?, ?)",
+                    (ingredient_id, effect_id, ingredient_order, bool(is_main)),
+                )
+
+    conn.commit()
+    conn.close()

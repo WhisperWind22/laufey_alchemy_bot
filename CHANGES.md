@@ -19,3 +19,10 @@
 - Switched database rebuild to v4 data sources (`ingredients_v4.json`, `effect_categories_v4.csv`).
 - Allowed duplicate ingredients with different add effects in the crafting flow.
 - Simplified optimal recipe search/scoring to use v4 suppression output.
+
+# Changes (2026-02-07)
+
+- Added v5 data loader (`alchemy_tools/v5_data.py`) and v5 optimal recipe search (`alchemy_tools/v5_recipe_search.py`).
+- Switched bot effect resolution and token validation to a stable wrapper (`effect_suppression.py`) backed by v5 engine.
+- Updated DB rebuild to v5 pack by default (`reset_db.py`, `alchemy_tools/db_fill.py:fill_ingredients_table_v5`).
+- Updated crafting UI to show v5 main/add effects from the v5 pack (not DB-derived text), keeping tokens as `CODE1..3`.
