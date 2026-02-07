@@ -1,0 +1,189 @@
+{
+  "version": "v5",
+  "generated_at": "2026-02-06",
+  "max_final_effects": 4,
+  "collapse_groups": {
+    "poison": {
+      "tiers_order": [
+        "weak",
+        "medium",
+        "strong",
+        "deadly"
+      ],
+      "keep_strongest_only": true
+    },
+    "antidote": {
+      "tiers_order": [
+        "weak",
+        "medium",
+        "strong",
+        "deadly"
+      ],
+      "keep_strongest_only": true
+    }
+  },
+  "poison_antidote_rules": {
+    "deadly_antidote_capacity": [
+      {
+        "cancels": {
+          "deadly": 1
+        }
+      },
+      {
+        "cancels": {
+          "strong": 2
+        }
+      },
+      {
+        "cancels": {
+          "medium": 3
+        }
+      },
+      {
+        "cancels": {
+          "weak": 4
+        }
+      },
+      {
+        "cancels": {
+          "strong": 1,
+          "medium": 2
+        }
+      }
+    ],
+    "tier_rank": {
+      "weak": 1,
+      "medium": 2,
+      "strong": 3,
+      "deadly": 4
+    },
+    "same_tier_cancels": true,
+    "cross_tier_mode": "downgrade_stronger_by_difference"
+  },
+  "mutual_exclusive_pairs": [
+    {
+      "a": "truth",
+      "b": "lie"
+    },
+    {
+      "a": "intoxication",
+      "b": "sobriety"
+    },
+    {
+      "a": "sleep",
+      "b": "wake"
+    },
+    {
+      "a": "sleep",
+      "b": "cant_sleep"
+    }
+  ],
+  "block_rules": [
+    {
+      "if_any_of": [
+        "temptation_resistance"
+      ],
+      "then_block": [
+        "kleptomania",
+        "curious_varvara"
+      ],
+      "note": "Стойкость к соблазнам блокирует клептоманию и 'Любопытную Варвару'."
+    },
+    {
+      "if_any_of": [
+        "mental_clarity",
+        "mental_cleanse",
+        "mental_protection"
+      ],
+      "then_block": [
+        "hallucinations",
+        "nature_craving"
+      ],
+      "note": "Прояснение/очистка/защита блокируют галлюцинации и тягу к природе."
+    },
+    {
+      "if_any_of": [
+        "reason_restore"
+      ],
+      "then_block": [
+        "reason_clouding"
+      ],
+      "note": "Восстановление 'Разума' блокирует затмение 'Разума'."
+    },
+    {
+      "if_any_of": [
+        "stop_bleeding",
+        "healing"
+      ],
+      "then_block": [
+        "bleeding"
+      ],
+      "note": "Кровоостанавливающее или исцеление блокирует кровотечение."
+    },
+    {
+      "if_any_of": [
+        "restore_energy"
+      ],
+      "then_block": [
+        "energy_down"
+      ],
+      "note": "Восстановление энергии блокирует понижение энергии."
+    },
+    {
+      "if_any_of": [
+        "cant_sleep"
+      ],
+      "then_block": [
+        "sleep"
+      ],
+      "note": "'Невозможно уснуть' подавляет эффекты сна."
+    },
+    {
+      "if_any_of": [
+        "gender_toxin"
+      ],
+      "then_blocked_by_any_of": [
+        "cant_sleep",
+        "sobriety"
+      ],
+      "note": "Ядовито для женщин... блокируется 'невозможно уснуть' и отрезвляющими (упрощённо, без учёта пола)."
+    }
+  ],
+  "composite_suppression": [
+    {
+      "target_kind": "poison_bleeding",
+      "requires_all": [
+        {
+          "kind": "antidote",
+          "tier": "medium"
+        },
+        {
+          "kind_any_of": [
+            "stop_bleeding",
+            "healing"
+          ]
+        }
+      ],
+      "result": "cancel_target_only",
+      "note": "Средний яд (кровотечение) = среднее противоядие + кровоостанавливающее/исцеление."
+    },
+    {
+      "target_kind": "poison_energy_down",
+      "requires_all": [
+        {
+          "kind": "antidote",
+          "tier": "weak"
+        },
+        {
+          "kind": "restore_energy"
+        }
+      ],
+      "result": "cancel_target_only",
+      "note": "Слабый яд (понижение энергии) = слабое противоядие + восстановление энергии."
+    }
+  ],
+  "formula_constraints": {
+    "no_duplicate_same_token": true,
+    "allow_duplicate_same_ingredient_different_add": true
+  }
+}
